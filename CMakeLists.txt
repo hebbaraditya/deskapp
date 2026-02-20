@@ -7,6 +7,11 @@ set(OpenGL_GL_PREFERENCE GLVND)
 find_package(OpenGL REQUIRED)
 find_package(glfw3 REQUIRED)
 
+# ONNX Runtime
+set(ONNXRUNTIME_ROOT "/opt/homebrew/Cellar/onnxruntime/1.24.2")
+include_directories(${ONNXRUNTIME_ROOT}/include)
+link_directories(${ONNXRUNTIME_ROOT}/lib)
+
 # ImGui sources
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui)
 set(IMGUI_SOURCES
@@ -36,6 +41,7 @@ target_link_libraries(deskapp PRIVATE
     glfw 
     OpenGL::GL
     ${CMAKE_DL_LIBS}
+    onnxruntime
 )
 
 set_source_files_properties(tinyfiledialogs.c PROPERTIES LANGUAGE C)
