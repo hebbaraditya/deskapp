@@ -9,6 +9,7 @@ find_package(glfw3 REQUIRED)
 
 # ONNX Runtime
 set(ONNXRUNTIME_ROOT "/opt/homebrew/Cellar/onnxruntime/1.24.2")
+include_directories(${ONNXRUNTIME_ROOT}/include/onnxruntime)
 include_directories(${ONNXRUNTIME_ROOT}/include)
 link_directories(${ONNXRUNTIME_ROOT}/lib)
 
@@ -24,21 +25,22 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-add_executable(deskapp 
-    main.cpp 
-    tinyfiledialogs.c 
+add_executable(deskapp
+    main.cpp
+    segmenter.cpp
+    tinyfiledialogs.c
     stb_image_impl.cpp
     ${IMGUI_SOURCES}
 )
 
-target_include_directories(deskapp PRIVATE 
-    ${IMGUI_DIR} 
+target_include_directories(deskapp PRIVATE
+    ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(deskapp PRIVATE 
-    glfw 
+target_link_libraries(deskapp PRIVATE
+    glfw
     OpenGL::GL
     ${CMAKE_DL_LIBS}
     onnxruntime
