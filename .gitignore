@@ -14,4 +14,5 @@ build/
 .idea/
 
 # macOS-specific files
-.DS_Store
+.DS_StoreFastSAM-s.pt
+export_fastsam.py
