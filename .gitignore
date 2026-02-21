@@ -15,5 +15,8 @@ build/
 
 # macOS-specific files
 .DS_StoreFastSAM-s.pt
-export_fastsam.py
 FastSAM-s.pt
+models/mobile_sam_encoder.onnx
+models/mobile_sam_encoder.onnx.data
+models/mobile_sam_decoder.onnx
+models/mobile_sam.pt
