@@ -91,4 +91,4 @@ with torch.no_grad():
         },
     )
 print("  -> models/mobile_sam_decoder.onnx ✓")
-print("\nDone!")
+print("\nDone!")    
