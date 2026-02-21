@@ -1,260 +1,281 @@
 #include "segmenter.h"
-#include <cmath>
-#include <cstring>
 #include <algorithm>
-#include <numeric>
-#include <stdio.h>
-#include <cfloat>
+#include <cstring>
+#include <cmath>
+#include <cstdio>
 
+// ── ImageNet normalisation constants ─────────────────────────────────────────
+static constexpr float kMean[3] = {123.675f, 116.28f,  103.53f};
+static constexpr float kStd[3]  = {58.395f,  57.12f,   57.375f};
+static constexpr int   kSAMSize = 1024;
+static constexpr int   kEmbedH  = 64;
+static constexpr int   kEmbedW  = 64;
+static constexpr int   kEmbedC  = 256;
+
+// ─────────────────────────────────────────────────────────────────────────────
 Segmenter::Segmenter()
-    : m_env(ORT_LOGGING_LEVEL_WARNING, "segmenter")
+    : env_(ORT_LOGGING_LEVEL_WARNING, "Segmenter")
 {
-    m_session_options.SetIntraOpNumThreads(1);
-    m_session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+    session_opts_.SetIntraOpNumThreads(4);
+    session_opts_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 }
 
-Segmenter::~Segmenter() {}
-
-bool Segmenter::load(const std::string& model_path) {
+// ─────────────────────────────────────────────────────────────────────────────
+bool Segmenter::loadModels(const std::string& encoder_path,
+                           const std::string& decoder_path)
+{
     try {
-        m_session = std::make_unique<Ort::Session>(
-            m_env,
-            model_path.c_str(),
-            m_session_options
-        );
-        m_loaded = true;
-        printf("[Segmenter] Model loaded: %s\n", model_path.c_str());
-        return true;
+        encoder_session_ = std::make_unique<Ort::Session>(
+            env_, encoder_path.c_str(), session_opts_);
+        encoder_ready_ = true;
+        printf("[Segmenter] Encoder loaded: %s\n", encoder_path.c_str());
     } catch (const Ort::Exception& e) {
-        fprintf(stderr, "[Segmenter] Failed to load model: %s\n", e.what());
-        m_loaded = false;
+        printf("[Segmenter] Failed to load encoder: %s\n", e.what());
         return false;
     }
-}
 
-SegmentResult Segmenter::run(
-    const std::vector<unsigned char>& pixels,
-    int image_width,
-    int image_height,
-    float click_x,
-    float click_y)
-{
-    SegmentResult result;
-    result.width   = image_width;
-    result.height  = image_height;
-    result.success = false;
-
-    if (!m_loaded) {
-        fprintf(stderr, "[Segmenter] Model not loaded.\n");
-        return result;
-    }
-
-    // --- Preprocess ---
-    std::vector<float> input_tensor = preprocess(pixels, image_width, image_height);
-
-    // --- Build input tensor ---
-    std::array<int64_t, 4> input_shape = {1, 3, MODEL_SIZE, MODEL_SIZE};
-    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-    Ort::Value input_ort = Ort::Value::CreateTensor<float>(
-        mem_info,
-        input_tensor.data(),
-        input_tensor.size(),
-        input_shape.data(),
-        input_shape.size()
-    );
-
-    // --- Run inference ---
-    const char* input_names[]  = {"images"};
-    const char* output_names[] = {"output0", "output1"};
-
-    std::vector<Ort::Value> outputs;
     try {
-        outputs = m_session->Run(
-            Ort::RunOptions{nullptr},
-            input_names,
-            &input_ort,
-            1,
-            output_names,
-            2
-        );
+        decoder_session_ = std::make_unique<Ort::Session>(
+            env_, decoder_path.c_str(), session_opts_);
+        decoder_ready_ = true;
+        printf("[Segmenter] Decoder loaded: %s\n", decoder_path.c_str());
     } catch (const Ort::Exception& e) {
-        fprintf(stderr, "[Segmenter] Inference failed: %s\n", e.what());
-        return result;
+        printf("[Segmenter] Failed to load decoder: %s\n", e.what());
+        return false;
     }
 
-    // output0: [1, 37, 8400]     — detections
-    // output1: [1, 32, 160, 160] — prototype masks
-    const float* out0_ptr = outputs[0].GetTensorData<float>();
-    const float* out1_ptr = outputs[1].GetTensorData<float>();
-
-    auto out0_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-    auto out1_shape = outputs[1].GetTensorTypeAndShapeInfo().GetShape();
-
-    int num_features   = (int)out0_shape[1]; // 37
-    int num_detections = (int)out0_shape[2]; // 8400
-    int proto_h        = (int)out1_shape[2]; // 160
-    int proto_w        = (int)out1_shape[3]; // 160
-    int num_protos     = (int)out1_shape[1]; // 32
-
-    std::vector<float> output0(out0_ptr, out0_ptr + num_features * num_detections);
-    std::vector<float> output1(out1_ptr, out1_ptr + num_protos * proto_h * proto_w);
-
-    // --- Postprocess ---
-    result.mask    = postprocess(output0, output1, image_width, image_height, click_x, click_y);
-    result.success = !result.mask.empty();
-    return result;
+    return true;
 }
 
-// Resize + normalize into NCHW float tensor
-std::vector<float> Segmenter::preprocess(
-    const std::vector<unsigned char>& pixels,
-    int src_width,
-    int src_height)
+// ─────────────────────────────────────────────────────────────────────────────
+// Preprocess: RGBA uint8 -> float32 [1, 3, 1024, 1024]
+// Resizes longest side to 1024, pads remainder with zeros.
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<float> Segmenter::preprocess(const uint8_t* rgba, int w, int h)
 {
-    const int dst = MODEL_SIZE;
-    std::vector<float> tensor(3 * dst * dst);
+    float scale = static_cast<float>(kSAMSize) / std::max(w, h);
+    int   rw    = static_cast<int>(std::round(w * scale));
+    int   rh    = static_cast<int>(std::round(h * scale));
 
-    float scale_x = (float)src_width  / dst;
-    float scale_y = (float)src_height / dst;
+    // Bilinear resize into temporary RGB buffer
+    std::vector<uint8_t> rgb_resized(rw * rh * 3);
+    for (int y = 0; y < rh; ++y) {
+        float src_y = (y + 0.5f) / scale - 0.5f;
+        int   y0    = std::max(0, (int)src_y);
+        int   y1    = std::min(h - 1, y0 + 1);
+        float wy    = src_y - y0;
 
-    const float mean[3] = {0.485f, 0.456f, 0.406f};
-    const float std_[3] = {0.229f, 0.224f, 0.225f};
+        for (int x = 0; x < rw; ++x) {
+            float src_x = (x + 0.5f) / scale - 0.5f;
+            int   x0    = std::max(0, (int)src_x);
+            int   x1    = std::min(w - 1, x0 + 1);
+            float wx    = src_x - x0;
 
-    for (int y = 0; y < dst; y++) {
-        for (int x = 0; x < dst; x++) {
-            int sx = std::min((int)(x * scale_x), src_width  - 1);
-            int sy = std::min((int)(y * scale_y), src_height - 1);
+            for (int c = 0; c < 3; ++c) {
+                float v00 = rgba[(y0 * w + x0) * 4 + c];
+                float v01 = rgba[(y0 * w + x1) * 4 + c];
+                float v10 = rgba[(y1 * w + x0) * 4 + c];
+                float v11 = rgba[(y1 * w + x1) * 4 + c];
+                float val = (1 - wy) * ((1 - wx) * v00 + wx * v01)
+                           +     wy  * ((1 - wx) * v10 + wx * v11);
+                rgb_resized[(y * rw + x) * 3 + c] = static_cast<uint8_t>(val);
+            }
+        }
+    }
 
-            int src_idx = (sy * src_width + sx) * 4;
-            float r = pixels[src_idx + 0] / 255.0f;
-            float g = pixels[src_idx + 1] / 255.0f;
-            float b = pixels[src_idx + 2] / 255.0f;
-
-            tensor[0 * dst * dst + y * dst + x] = (r - mean[0]) / std_[0];
-            tensor[1 * dst * dst + y * dst + x] = (g - mean[1]) / std_[1];
-            tensor[2 * dst * dst + y * dst + x] = (b - mean[2]) / std_[2];
+    // Pad to 1024x1024 and normalise -> CHW float
+    std::vector<float> tensor(3 * kSAMSize * kSAMSize, 0.f);
+    for (int y = 0; y < rh; ++y) {
+        for (int x = 0; x < rw; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                float pixel = rgb_resized[(y * rw + x) * 3 + c];
+                float norm  = (pixel - kMean[c]) / kStd[c];
+                tensor[c * kSAMSize * kSAMSize + y * kSAMSize + x] = norm;
+            }
         }
     }
     return tensor;
 }
 
-static float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
-static float bilinear_sample(const std::vector<float>& map, int w, int h, float x, float y) {
-    x = std::max(0.0f, std::min((float)(w - 1), x));
-    y = std::max(0.0f, std::min((float)(h - 1), y));
-
-    int x0 = (int)x, y0 = (int)y;
-    int x1 = std::min(x0 + 1, w - 1);
-    int y1 = std::min(y0 + 1, h - 1);
-
-    float wx = x - x0, wy = y - y0;
-
-    float v00 = map[y0 * w + x0];
-    float v10 = map[y0 * w + x1];
-    float v01 = map[y1 * w + x0];
-    float v11 = map[y1 * w + x1];
-
-    return v00 * (1 - wx) * (1 - wy)
-         + v10 *      wx  * (1 - wy)
-         + v01 * (1 - wx) *      wy
-         + v11 *      wx  *      wy;
-}
-
-std::vector<unsigned char> Segmenter::postprocess(
-    const std::vector<float>& output0,
-    const std::vector<float>& output1,
-    int src_width,
-    int src_height,
-    float click_x,
-    float click_y)
+// ─────────────────────────────────────────────────────────────────────────────
+bool Segmenter::encodeImage(const uint8_t* pixels_rgba, int width, int height)
 {
-    const int num_det   = 8400;
-    const int proto_h   = 160;
-    const int proto_w   = 160;
-    const int num_proto = 32;
+    if (!encoder_ready_) {
+        printf("[Segmenter] Encoder not loaded.\n");
+        return false;
+    }
 
-    // Scale click from image space → model space
-    float scale_x       = (float)MODEL_SIZE / src_width;
-    float scale_y       = (float)MODEL_SIZE / src_height;
-    float click_model_x = click_x * scale_x;
-    float click_model_y = click_y * scale_y;
+    image_encoded_ = false;
+    image_w_       = width;
+    image_h_       = height;
 
-    const float conf_thresh = 0.3f;
+    std::vector<float> input = preprocess(pixels_rgba, width, height);
 
-    // Pick the SMALLEST box containing the click with sufficient confidence.
-    // Smaller box = more specific object = better match for what was clicked.
-    int   best_det  = -1;
-    float best_area = FLT_MAX;
+    std::vector<int64_t> input_shape = {1, 3, kSAMSize, kSAMSize};
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-    for (int d = 0; d < num_det; d++) {
-        float score = output0[4 * num_det + d];
-        if (score < conf_thresh) continue;
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        input.data(), input.size(),
+        input_shape.data(), input_shape.size());
 
-        float cx = output0[0 * num_det + d];
-        float cy = output0[1 * num_det + d];
-        float w  = output0[2 * num_det + d];
-        float h  = output0[3 * num_det + d];
+    const char* input_names[]  = {"image"};
+    const char* output_names[] = {"image_embeddings"};
 
-        float x1 = cx - w * 0.5f;
-        float y1 = cy - h * 0.5f;
-        float x2 = cx + w * 0.5f;
-        float y2 = cy + h * 0.5f;
+    try {
+        auto outputs = encoder_session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names,  &input_tensor, 1,
+            output_names, 1);
 
-        if (click_model_x >= x1 && click_model_x <= x2 &&
-            click_model_y >= y1 && click_model_y <= y2)
-        {
-            float area = w * h;
-            if (area < best_area) {
-                best_area = area;
-                best_det  = d;
-            }
+        size_t emb_size = kEmbedC * kEmbedH * kEmbedW;
+        embedding_.resize(emb_size);
+        std::memcpy(embedding_.data(),
+                    outputs[0].GetTensorData<float>(),
+                    emb_size * sizeof(float));
+
+        image_encoded_ = true;
+        printf("[Segmenter] Image encoded (%dx%d)\n", width, height);
+        return true;
+    } catch (const Ort::Exception& e) {
+        printf("[Segmenter] Encoder run failed: %s\n", e.what());
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+static float bilinear_sample(const float* data, int w, int h, float fx, float fy)
+{
+    int x0 = std::max(0, (int)fx);
+    int y0 = std::max(0, (int)fy);
+    int x1 = std::min(w - 1, x0 + 1);
+    int y1 = std::min(h - 1, y0 + 1);
+    float wx = fx - x0, wy = fy - y0;
+    return (1-wy)*((1-wx)*data[y0*w+x0] + wx*data[y0*w+x1])
+          +   wy *((1-wx)*data[y1*w+x0] + wx*data[y1*w+x1]);
+}
+
+std::vector<uint8_t> Segmenter::upscaleMask(const float* low_res,
+                                             int mask_w, int mask_h,
+                                             int out_w,  int out_h)
+{
+    std::vector<uint8_t> result(out_w * out_h, 0);
+    float sx = static_cast<float>(mask_w - 1) / (out_w - 1);
+    float sy = static_cast<float>(mask_h - 1) / (out_h - 1);
+    for (int y = 0; y < out_h; ++y)
+        for (int x = 0; x < out_w; ++x)
+            result[y * out_w + x] =
+                (bilinear_sample(low_res, mask_w, mask_h, x*sx, y*sy) > 0.f)
+                ? 255 : 0;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+SegmentResult Segmenter::decode(const std::vector<PromptPoint>& points)
+{
+    SegmentResult result;
+    if (!decoder_ready_ || !image_encoded_ || points.empty())
+        return result;
+
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+
+    // 1. image_embeddings [1, 256, 64, 64]
+    std::vector<int64_t> emb_shape = {1, kEmbedC, kEmbedH, kEmbedW};
+    Ort::Value emb_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, embedding_.data(), embedding_.size(),
+        emb_shape.data(), emb_shape.size());
+
+    // 2. point_coords [1, N, 2] and point_labels [1, N]
+    int N = static_cast<int>(points.size());
+    float scale = static_cast<float>(kSAMSize) / std::max(image_w_, image_h_);
+
+    std::vector<float> coords(N * 2);
+    std::vector<float> labels(N);
+    for (int i = 0; i < N; ++i) {
+        coords[i * 2 + 0] = points[i].x * scale;
+        coords[i * 2 + 1] = points[i].y * scale;
+        labels[i]          = static_cast<float>(points[i].label);
+    }
+
+    std::vector<int64_t> coords_shape = {1, N, 2};
+    std::vector<int64_t> labels_shape = {1, N};
+
+    Ort::Value coords_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, coords.data(), coords.size(),
+        coords_shape.data(), coords_shape.size());
+
+    Ort::Value labels_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, labels.data(), labels.size(),
+        labels_shape.data(), labels_shape.size());
+
+    // 3. mask_input [1, 1, 256, 256] — zeros (no prior mask)
+    std::vector<float>   mask_input(256 * 256, 0.f);
+    std::vector<int64_t> mask_shape = {1, 1, 256, 256};
+    Ort::Value mask_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, mask_input.data(), mask_input.size(),
+        mask_shape.data(), mask_shape.size());
+
+    // 4. has_mask_input [1] = 0
+    std::vector<float>   has_mask        = {0.f};
+    std::vector<int64_t> has_mask_shape  = {1};
+    Ort::Value has_mask_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, has_mask.data(), has_mask.size(),
+        has_mask_shape.data(), has_mask_shape.size());
+
+    // 5. orig_im_size [2] = [height, width]
+    std::vector<float>   orig_size       = {(float)image_h_, (float)image_w_};
+    std::vector<int64_t> orig_size_shape = {2};
+    Ort::Value orig_size_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, orig_size.data(), orig_size.size(),
+        orig_size_shape.data(), orig_size_shape.size());
+
+    const char* input_names[] = {
+        "image_embeddings", "point_coords", "point_labels",
+        "mask_input", "has_mask_input", "orig_im_size"
+    };
+    const char* output_names[] = {"masks", "iou_predictions", "low_res_masks"};
+
+    std::vector<Ort::Value> inputs;
+    inputs.push_back(std::move(emb_tensor));
+    inputs.push_back(std::move(coords_tensor));
+    inputs.push_back(std::move(labels_tensor));
+    inputs.push_back(std::move(mask_tensor));
+    inputs.push_back(std::move(has_mask_tensor));
+    inputs.push_back(std::move(orig_size_tensor));
+
+    try {
+        auto outputs = decoder_session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names, inputs.data(), inputs.size(),
+            output_names, 3);
+
+        // masks: [1, 1, H, W] — SamOnnxModel upscales to orig size
+        auto& masks_out  = outputs[0];
+        auto  out_shape  = masks_out.GetTensorTypeAndShapeInfo().GetShape();
+        int   out_h      = (int)out_shape[2];
+        int   out_w      = (int)out_shape[3];
+        const float* mask_data = masks_out.GetTensorData<float>();
+        const float* iou_data  = outputs[1].GetTensorData<float>();
+
+        result.score  = iou_data[0];
+        result.width  = image_w_;
+        result.height = image_h_;
+        result.valid  = true;
+
+        if (out_w == image_w_ && out_h == image_h_) {
+            result.mask.resize(image_w_ * image_h_);
+            for (int i = 0; i < image_w_ * image_h_; ++i)
+                result.mask[i] = (mask_data[i] > 0.f) ? 255 : 0;
+        } else {
+            result.mask = upscaleMask(mask_data, out_w, out_h, image_w_, image_h_);
         }
+
+        printf("[Segmenter] Decoded %dx%d IoU=%.3f\n", image_w_, image_h_, result.score);
+        return result;
+    } catch (const Ort::Exception& e) {
+        printf("[Segmenter] Decoder run failed: %s\n", e.what());
+        return result;
     }
-
-    if (best_det < 0) {
-        printf("[Segmenter] No detection at click (%.1f, %.1f) in model space\n",
-               click_model_x, click_model_y);
-        return {};
-    }
-
-    float best_score = output0[4 * num_det + best_det];
-    printf("[Segmenter] Best detection %d, score=%.3f, area=%.1f\n",
-           best_det, best_score, best_area);
-
-    // Extract 32 mask coefficients
-    std::vector<float> coeffs(num_proto);
-    for (int p = 0; p < num_proto; p++) {
-        coeffs[p] = output0[(5 + p) * num_det + best_det];
-    }
-
-    // Compute mask at 160x160: sigmoid(coeffs dot protos)
-    std::vector<float> mask_160(proto_h * proto_w, 0.0f);
-    for (int p = 0; p < num_proto; p++) {
-        const float* proto_map = &output1[p * proto_h * proto_w];
-        for (int i = 0; i < proto_h * proto_w; i++) {
-            mask_160[i] += coeffs[p] * proto_map[i];
-        }
-    }
-    for (auto& v : mask_160) v = sigmoid(v);
-
-    // Scale up 160x160 → src_width x src_height using bilinear interpolation
-    std::vector<unsigned char> final_mask(src_width * src_height, 0);
-
-    float sx = (float)(proto_w - 1) / (src_width  - 1);
-    float sy = (float)(proto_h - 1) / (src_height - 1);
-
-    for (int y = 0; y < src_height; y++) {
-        for (int x = 0; x < src_width; x++) {
-            float mx  = x * sx;
-            float my  = y * sy;
-            float val = bilinear_sample(mask_160, proto_w, proto_h, mx, my);
-            final_mask[y * src_width + x] = (val > 0.5f) ? 255 : 0;
-        }
-    }
-
-    return final_mask;
 }
