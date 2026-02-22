@@ -4,6 +4,9 @@ project(deskapp)
 set(CMAKE_CXX_STANDARD 17)
 set(OpenGL_GL_PREFERENCE GLVND)
 
+# Silence macOS OpenGL deprecation warnings (OpenGL still works fine)
+add_definitions(-DGL_SILENCE_DEPRECATION)
+
 find_package(OpenGL REQUIRED)
 find_package(glfw3 REQUIRED)
 
@@ -28,6 +31,7 @@ set(IMGUI_SOURCES
 add_executable(deskapp
     main.cpp
     segmenter.cpp
+    text_tool.cpp
     tinyfiledialogs.c
     stb_image_impl.cpp
     ${IMGUI_SOURCES}

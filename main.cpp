@@ -9,12 +9,16 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #include "tinyfiledialogs.h"
 #include "segmenter.h"
+#include "canvas_objects.h"
+#include "transform_handles.h"
+#include "text_tool.h"
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void RenderCanvas(ImDrawList* draw_list, ImVec2 canvas_pos, ImVec2 canvas_size,
@@ -23,22 +27,11 @@ void RenderToolbar(ImVec2 window_size);
 void RenderTopBar(ImVec2 window_size);
 GLuint LoadTextureFromFile(const char* filename, int* out_width, int* out_height,
                            std::vector<unsigned char>& out_pixels);
-GLuint CreateTextureFromPixels(const std::vector<unsigned char>& pixels, int width, int height);
+GLuint CreateTextureFromPixels(const std::vector<unsigned char>& pixels, int w, int h);
 void   UpdateTextureFromPixels(GLuint tex_id, const std::vector<unsigned char>& pixels, int w, int h);
 void   ApplyMaskToPixels(std::vector<unsigned char>& pixels,
                          const std::vector<uint8_t>& mask, int width, int height);
 void   ExportImageAsPNG(int image_index);
-
-// ── Canvas image ──────────────────────────────────────────────────────────────
-struct CanvasImage {
-    GLuint      texture_id = 0;
-    ImVec2      position   = {0, 0};   // world space
-    ImVec2      size       = {0, 0};
-    float       scale      = 1.0f;
-    bool        selected   = false;
-    std::string filename;
-    std::vector<unsigned char> pixels; // original RGBA, never modified
-};
 
 // ── App state ─────────────────────────────────────────────────────────────────
 struct AppState {
@@ -47,19 +40,25 @@ struct AppState {
     bool   is_panning  = false;
     ImVec2 last_mouse_pos = {0, 0};
 
-    enum Tool { TOOL_SELECT, TOOL_HAND, TOOL_SEGMENT };
+    enum Tool { TOOL_SELECT, TOOL_HAND, TOOL_SEGMENT, TOOL_TEXT };
     Tool current_tool = TOOL_SELECT;
 
+    // Images
     std::vector<CanvasImage> images;
-    int  selected_image_index = -1;
-    bool is_dragging_image    = false;
-    ImVec2 drag_start_pos     = {0, 0};
+    int    selected_image_index = -1;
+    bool   is_dragging_image    = false;
+    ImVec2 drag_start_pos       = {0, 0};
+    // Per-image drag states for transform handles (keyed by index)
+    std::unordered_map<int, DragState> image_drags;
 
-    // ── Segment tool state ────────────────────────────────────────────────────
-    int  seg_image_index   = -1;
-    bool image_encoded     = false;
+    // Text
+    std::vector<TextObject> texts;
+    TextTool::State         text_state;
 
-    // Async encoding
+    // Segment
+    int  seg_image_index = -1;
+    bool image_encoded   = false;
+
     std::atomic<bool> is_encoding{false};
     std::atomic<bool> encode_done{false};
     std::atomic<bool> encode_ok{false};
@@ -69,64 +68,48 @@ struct AppState {
     GLuint overlay_texture = 0;
     int    overlay_w = 0, overlay_h = 0;
 
-    // Pending overlay update (written by encode thread, read by main thread)
-    std::mutex               overlay_mutex;
-    bool                     pending_overlay    = false;
+    std::mutex                 overlay_mutex;
+    bool                       pending_overlay = false;
     std::vector<unsigned char> pending_rgba;
-    int                      pending_ow = 0, pending_oh = 0;
+    int                        pending_ow = 0, pending_oh = 0;
 
-    // Status message
+    // Status toast
     std::string status_msg;
     float       status_timer = 0.f;
 
 } g_state;
 
-// ── Global segmenter ──────────────────────────────────────────────────────────
 Segmenter g_segmenter;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: build RGBA overlay from a SegmentResult
+// Overlay helpers
 // ─────────────────────────────────────────────────────────────────────────────
-static std::vector<unsigned char> BuildOverlayRGBA(const SegmentResult& result)
+static std::vector<unsigned char> BuildOverlayRGBA(const SegmentResult& r)
 {
-    int w = result.width, h = result.height;
-    std::vector<unsigned char> rgba(w * h * 4, 0);
-    for (int i = 0; i < w * h; i++) {
-        if (result.mask[i] > 0) {
-            rgba[i * 4 + 0] = 80;
-            rgba[i * 4 + 1] = 180;
-            rgba[i * 4 + 2] = 255;
-            rgba[i * 4 + 3] = 120;
+    std::vector<unsigned char> rgba(r.width * r.height * 4, 0);
+    for (int i = 0; i < r.width * r.height; i++) {
+        if (r.mask[i] > 0) {
+            rgba[i*4+0]=80; rgba[i*4+1]=180; rgba[i*4+2]=255; rgba[i*4+3]=120;
         }
     }
     return rgba;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: apply pending overlay to GPU texture (called from main thread)
-// ─────────────────────────────────────────────────────────────────────────────
 static void FlushPendingOverlay()
 {
     std::lock_guard<std::mutex> lock(g_state.overlay_mutex);
     if (!g_state.pending_overlay) return;
-
     int w = g_state.pending_ow, h = g_state.pending_oh;
-
-    if (g_state.overlay_texture && g_state.overlay_w == w && g_state.overlay_h == h) {
+    if (g_state.overlay_texture && g_state.overlay_w==w && g_state.overlay_h==h)
         UpdateTextureFromPixels(g_state.overlay_texture, g_state.pending_rgba, w, h);
-    } else {
-        if (g_state.overlay_texture)
-            glDeleteTextures(1, &g_state.overlay_texture);
+    else {
+        if (g_state.overlay_texture) glDeleteTextures(1, &g_state.overlay_texture);
         g_state.overlay_texture = CreateTextureFromPixels(g_state.pending_rgba, w, h);
-        g_state.overlay_w = w;
-        g_state.overlay_h = h;
+        g_state.overlay_w = w; g_state.overlay_h = h;
     }
     g_state.pending_overlay = false;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: set a pending overlay from any thread
-// ─────────────────────────────────────────────────────────────────────────────
 static void QueueOverlay(const SegmentResult& result)
 {
     if (!result.valid) return;
@@ -138,37 +121,32 @@ static void QueueOverlay(const SegmentResult& result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: commit current mask → new canvas image, then reset segment state
+// CommitExtraction
 // ─────────────────────────────────────────────────────────────────────────────
 static void CommitExtraction()
 {
     if (g_state.seg_image_index < 0 || g_state.prompt_points.empty()) return;
-
     SegmentResult result = g_segmenter.decode(g_state.prompt_points);
-    if (!result.valid) {
-        printf("[Segment] Decode returned invalid result.\n");
-        return;
-    }
+    if (!result.valid) { printf("[Seg] Invalid result.\n"); return; }
 
     CanvasImage& src = g_state.images[g_state.seg_image_index];
+    CanvasImage ex;
+    ex.pixels   = src.pixels;
+    ex.size      = src.size;
+    ex.transform.scale = src.transform.scale;
+    ex.filename  = src.filename + "_extracted";
 
-    CanvasImage extracted;
-    extracted.pixels   = src.pixels;
-    extracted.size     = src.size;
-    extracted.scale    = src.scale;
-    extracted.selected = false;
-    extracted.filename = src.filename + "_extracted";
+    ApplyMaskToPixels(ex.pixels, result.mask, (int)src.size.x, (int)src.size.y);
+    ex.texture_id = CreateTextureFromPixels(ex.pixels, (int)src.size.x, (int)src.size.y);
+    ex.transform.position = {
+        src.transform.position.x + src.size.x * src.transform.scale + 20,
+        src.transform.position.y
+    };
 
-    ApplyMaskToPixels(extracted.pixels, result.mask, (int)src.size.x, (int)src.size.y);
-    extracted.texture_id = CreateTextureFromPixels(extracted.pixels, (int)src.size.x, (int)src.size.y);
-    extracted.position   = ImVec2(src.position.x + src.size.x * src.scale + 20, src.position.y);
+    g_state.images.push_back(ex);
+    g_state.status_msg = "Extraction committed!";
+    g_state.status_timer = 3.f;
 
-    g_state.images.push_back(extracted);
-    g_state.status_msg   = "Extraction committed!";
-    g_state.status_timer = 3.0f;
-    printf("[Segment] Extraction committed — new image added to canvas.\n");
-
-    // Reset segment state
     g_state.prompt_points.clear();
     g_state.seg_image_index = -1;
     g_state.image_encoded   = false;
@@ -179,40 +157,32 @@ static void CommitExtraction()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Export a canvas image as PNG via save dialog
+// ExportImageAsPNG
 // ─────────────────────────────────────────────────────────────────────────────
-void ExportImageAsPNG(int image_index)
+void ExportImageAsPNG(int idx)
 {
-    if (image_index < 0 || image_index >= (int)g_state.images.size()) return;
-    CanvasImage& img = g_state.images[image_index];
+    if (idx < 0 || idx >= (int)g_state.images.size()) return;
+    CanvasImage& img = g_state.images[idx];
     if (img.pixels.empty()) return;
-
-    const char* filters[]  = {"*.png"};
-    const char* save_path  = tinyfd_saveFileDialog("Export as PNG", "output.png",
-                                                    1, filters, "PNG Image");
-    if (!save_path) return;
-
-    int w = (int)img.size.x, h = (int)img.size.y;
-    int result = stbi_write_png(save_path, w, h, 4, img.pixels.data(), w * 4);
-
-    if (result) {
-        g_state.status_msg   = std::string("Exported: ") + save_path;
-        g_state.status_timer = 4.0f;
-        printf("[Export] Saved to %s\n", save_path);
+    const char* filters[] = {"*.png"};
+    const char* path = tinyfd_saveFileDialog("Export PNG", "output.png", 1, filters, "PNG");
+    if (!path) return;
+    int w=(int)img.size.x, h=(int)img.size.y;
+    if (stbi_write_png(path, w, h, 4, img.pixels.data(), w*4)) {
+        g_state.status_msg   = std::string("Exported: ") + path;
+        g_state.status_timer = 4.f;
     } else {
         g_state.status_msg   = "Export failed!";
-        g_state.status_timer = 3.0f;
-        printf("[Export] Failed to write %s\n", save_path);
+        g_state.status_timer = 3.f;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (!glfwInit()) {
-        fprintf(stderr, "Failed to initialize GLFW\n");
-        return -1;
-    }
+    if (!glfwInit()) { fprintf(stderr, "Failed to init GLFW\n"); return -1; }
 
     const char* glsl_version = "#version 330";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -223,14 +193,9 @@ int main(int argc, char** argv)
 #endif
 
     GLFWwindow* window = glfwCreateWindow(1440, 900, "Deskapp", NULL, NULL);
-    if (!window) {
-        fprintf(stderr, "Failed to create GLFW window\n");
-        glfwTerminate();
-        return -1;
-    }
+    if (!window) { fprintf(stderr, "Failed to create window\n"); glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
-
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -241,81 +206,74 @@ int main(int argc, char** argv)
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding    = 0.0f;
-    style.ChildRounding     = 0.0f;
-    style.FrameRounding     = 4.0f;
-    style.GrabRounding      = 4.0f;
-    style.PopupRounding     = 4.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.WindowBorderSize  = 0.0f;
-    style.FrameBorderSize   = 0.0f;
+    style.WindowRounding = style.ChildRounding  = 0.f;
+    style.FrameRounding  = style.GrabRounding   = 4.f;
+    style.PopupRounding  = style.ScrollbarRounding = 4.f;
+    style.WindowBorderSize = style.FrameBorderSize = 0.f;
 
-    ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg]         = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    colors[ImGuiCol_ChildBg]          = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);
-    colors[ImGuiCol_PopupBg]          = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
-    colors[ImGuiCol_Border]           = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_FrameBg]          = ImVec4(0.18f, 0.18f, 0.18f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered]   = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
-    colors[ImGuiCol_FrameBgActive]    = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
-    colors[ImGuiCol_TitleBg]          = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
-    colors[ImGuiCol_TitleBgActive]    = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
-    colors[ImGuiCol_Button]           = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_ButtonHovered]    = ImVec4(0.28f, 0.28f, 0.28f, 1.00f);
-    colors[ImGuiCol_ButtonActive]     = ImVec4(0.35f, 0.35f, 0.35f, 1.00f);
-    colors[ImGuiCol_CheckMark]        = ImVec4(0.40f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrab]       = ImVec4(0.40f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.50f, 0.70f, 1.00f, 1.00f);
+    ImVec4* c = style.Colors;
+    c[ImGuiCol_WindowBg]         = {0.10f,0.10f,0.10f,1.f};
+    c[ImGuiCol_ChildBg]          = {0.12f,0.12f,0.12f,1.f};
+    c[ImGuiCol_PopupBg]          = {0.15f,0.15f,0.15f,1.f};
+    c[ImGuiCol_Border]           = {0.20f,0.20f,0.20f,1.f};
+    c[ImGuiCol_FrameBg]          = {0.18f,0.18f,0.18f,1.f};
+    c[ImGuiCol_FrameBgHovered]   = {0.25f,0.25f,0.25f,1.f};
+    c[ImGuiCol_FrameBgActive]    = {0.30f,0.30f,0.30f,1.f};
+    c[ImGuiCol_TitleBg]          = {0.08f,0.08f,0.08f,1.f};
+    c[ImGuiCol_TitleBgActive]    = {0.08f,0.08f,0.08f,1.f};
+    c[ImGuiCol_Button]           = {0.20f,0.20f,0.20f,1.f};
+    c[ImGuiCol_ButtonHovered]    = {0.28f,0.28f,0.28f,1.f};
+    c[ImGuiCol_ButtonActive]     = {0.35f,0.35f,0.35f,1.f};
+    c[ImGuiCol_CheckMark]        = {0.40f,0.60f,1.00f,1.f};
+    c[ImGuiCol_SliderGrab]       = {0.40f,0.60f,1.00f,1.f};
+    c[ImGuiCol_SliderGrabActive] = {0.50f,0.70f,1.00f,1.f};
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    // Load MobileSAM models
-    if (!g_segmenter.loadModels("models/mobile_sam_encoder.onnx",
-                                "models/mobile_sam_decoder.onnx")) {
-        fprintf(stderr, "Warning: Could not load MobileSAM models.\n");
-    }
+    // Load fonts BEFORE first NewFrame so atlas includes them
+    TextTool::loadFonts();
 
+    if (!g_segmenter.loadModels("models/mobile_sam_encoder.onnx",
+                                "models/mobile_sam_decoder.onnx"))
+        fprintf(stderr, "Warning: MobileSAM models not found.\n");
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // ── Check async encode completion ─────────────────────────────────────
+        // Async encode completion
         if (g_state.encode_done.exchange(false)) {
-            if (g_state.encode_thread.joinable())
-                g_state.encode_thread.join();
-
+            if (g_state.encode_thread.joinable()) g_state.encode_thread.join();
             g_state.image_encoded = g_state.encode_ok.load();
             g_state.is_encoding   = false;
-
             if (g_state.image_encoded) {
-                // Auto-decode with any queued points
-                if (!g_state.prompt_points.empty()) {
-                    SegmentResult r = g_segmenter.decode(g_state.prompt_points);
-                    QueueOverlay(r);
-                }
-                g_state.status_msg   = "Image encoded. Click to segment.";
-                g_state.status_timer = 3.0f;
+                if (!g_state.prompt_points.empty())
+                    QueueOverlay(g_segmenter.decode(g_state.prompt_points));
+                g_state.status_msg   = "Encoded. Click to segment.";
+                g_state.status_timer = 3.f;
             } else {
                 g_state.status_msg   = "Encode failed!";
-                g_state.status_timer = 3.0f;
+                g_state.status_timer = 3.f;
             }
         }
 
-        // ── Flush pending overlay to GPU ──────────────────────────────────────
         FlushPendingOverlay();
-
-        // ── Status timer ──────────────────────────────────────────────────────
-        if (g_state.status_timer > 0.f)
-            g_state.status_timer -= io.DeltaTime;
+        if (g_state.status_timer > 0.f) g_state.status_timer -= io.DeltaTime;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImVec2 window_size = ImGui::GetIO().DisplaySize;
+        ImVec2 win_size = io.DisplaySize;
 
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(window_size);
+        // Text style panel (floating, above everything)
+        if (g_state.current_tool == AppState::TOOL_TEXT)
+            TextTool::drawStylePanel(g_state.text_state, g_state.texts);
+
+        // Main fullscreen window
+        ImGui::SetNextWindowPos({0,0});
+        ImGui::SetNextWindowSize(win_size);
         ImGui::Begin("MainWindow", nullptr,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -323,11 +281,11 @@ int main(int argc, char** argv)
             ImGuiWindowFlags_NoBringToFrontOnFocus |
             ImGuiWindowFlags_NoBackground);
 
-        RenderTopBar(window_size);
-        RenderToolbar(window_size);
+        RenderTopBar(win_size);
+        RenderToolbar(win_size);
 
-        ImVec2 canvas_pos  = ImVec2(60, 56);
-        ImVec2 canvas_size = ImVec2(window_size.x - 60, window_size.y - 56);
+        ImVec2 canvas_pos  = {60.f, 56.f};
+        ImVec2 canvas_size = {win_size.x - 60.f, win_size.y - 56.f};
 
         ImGui::SetCursorPos(canvas_pos);
         ImGui::BeginChild("Canvas", canvas_size, false,
@@ -339,36 +297,32 @@ int main(int argc, char** argv)
 
         ImGui::EndChild();
 
-        // ── Status bar ────────────────────────────────────────────────────────
+        // Status toast
         if (g_state.status_timer > 0.f && !g_state.status_msg.empty()) {
-            ImGui::SetNextWindowPos(ImVec2(canvas_pos.x + 10, window_size.y - 36));
-            ImGui::SetNextWindowBgAlpha(0.75f);
+            ImGui::SetNextWindowPos({canvas_pos.x + 10.f, win_size.y - 36.f});
+            ImGui::SetNextWindowBgAlpha(0.78f);
             ImGui::Begin("##status", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
                 ImGuiWindowFlags_NoNav);
-            ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.f),
-                               "%s", g_state.status_msg.c_str());
+            ImGui::TextColored({0.9f,0.9f,0.9f,1.f}, "%s", g_state.status_msg.c_str());
             ImGui::End();
         }
 
         ImGui::End();
 
         ImGui::Render();
-        int display_w, display_h;
-        glfwGetFramebufferSize(window, &display_w, &display_h);
-        glViewport(0, 0, display_w, display_h);
-        glClearColor(0.10f, 0.10f, 0.10f, 1.00f);
+        int dw, dh;
+        glfwGetFramebufferSize(window, &dw, &dh);
+        glViewport(0, 0, dw, dh);
+        glClearColor(0.10f,0.10f,0.10f,1.f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
 
-    // Wait for any running encode thread
-    if (g_state.encode_thread.joinable())
-        g_state.encode_thread.join();
-
+    if (g_state.encode_thread.joinable()) g_state.encode_thread.join();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
@@ -378,23 +332,23 @@ int main(int argc, char** argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void RenderTopBar(ImVec2 window_size)
+// RenderTopBar
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderTopBar(ImVec2 win_size)
 {
-    const float bar_height = 56.0f;
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    draw_list->AddRectFilled(ImVec2(0, 0), ImVec2(window_size.x, bar_height),
-                             IM_COL32(20, 20, 20, 255));
-    draw_list->AddLine(ImVec2(0, bar_height), ImVec2(window_size.x, bar_height),
-                       IM_COL32(40, 40, 40, 255), 1.0f);
+    const float bar_h = 56.f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled({0,0}, {win_size.x, bar_h}, IM_COL32(20,20,20,255));
+    dl->AddLine({0, bar_h}, {win_size.x, bar_h}, IM_COL32(40,40,40,255), 1.f);
 
-    ImGui::SetCursorPos(ImVec2(20, 16));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+    ImGui::SetCursorPos({20, 16});
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1,1));
     ImGui::Text("Deskapp");
     ImGui::PopStyleColor();
 
-    ImGui::SetCursorPos(ImVec2(120, 12));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 8));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(4, 0));
+    ImGui::SetCursorPos({120, 12});
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {12, 8});
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  {4, 0});
 
     if (ImGui::Button("File")) {}
     ImGui::SameLine();
@@ -403,276 +357,303 @@ void RenderTopBar(ImVec2 window_size)
     if (ImGui::Button("View")) {}
     ImGui::SameLine();
 
-    // ── Image button: load image ──────────────────────────────────────────────
+    // Load image
     if (ImGui::Button("Image")) {
-        const char* filters[] = {"*.png", "*.jpg", "*.jpeg", "*.bmp"};
-        const char* filepath = tinyfd_openFileDialog("Select Image", "", 4, filters,
-                                                     "Image Files", 0);
-        if (filepath) {
+        const char* filters[] = {"*.png","*.jpg","*.jpeg","*.bmp"};
+        const char* fp = tinyfd_openFileDialog("Select Image","",4,filters,"Image Files",0);
+        if (fp) {
             CanvasImage img;
-            img.scale    = 1.0f;
-            img.selected = false;
-            img.filename = filepath;
-
+            img.transform.scale = 1.f;
+            img.selected        = false;
+            img.filename        = fp;
             int w, h;
-            img.texture_id = LoadTextureFromFile(filepath, &w, &h, img.pixels);
+            img.texture_id = LoadTextureFromFile(fp, &w, &h, img.pixels);
             if (img.texture_id) {
-                img.size     = ImVec2((float)w, (float)h);
-                img.position = ImVec2(-(float)w * 0.5f, -(float)h * 0.5f);
+                img.size = {(float)w, (float)h};
+                img.transform.position = {-(float)w * 0.5f, -(float)h * 0.5f};
                 g_state.images.push_back(img);
             }
         }
     }
     ImGui::SameLine();
 
-    // ── Export button: save selected image ────────────────────────────────────
-    bool has_selected = (g_state.selected_image_index >= 0 &&
-                         g_state.selected_image_index < (int)g_state.images.size());
-    if (!has_selected) {
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.15f, 0.15f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.15f, 0.15f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.4f, 0.4f, 0.4f, 1.f));
+    // Export PNG
+    bool has_sel = (g_state.selected_image_index >= 0 &&
+                    g_state.selected_image_index < (int)g_state.images.size());
+    if (!has_sel) {
+        ImGui::PushStyleColor(ImGuiCol_Button,        {0.15f,0.15f,0.15f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.15f,0.15f,0.15f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_Text,          {0.4f,0.4f,0.4f,1.f});
     }
-    if (ImGui::Button("Export PNG")) {
-        if (has_selected)
-            ExportImageAsPNG(g_state.selected_image_index);
-    }
-    if (!has_selected) {
+    if (ImGui::Button("Export PNG") && has_sel)
+        ExportImageAsPNG(g_state.selected_image_index);
+    if (!has_sel) {
         ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Select an image first");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Select an image first");
     }
 
     ImGui::PopStyleVar(2);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void RenderToolbar(ImVec2 window_size)
+// RenderToolbar
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderToolbar(ImVec2 win_size)
 {
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    draw_list->AddRectFilled(ImVec2(0, 56), ImVec2(60, window_size.y),
-                             IM_COL32(20, 20, 20, 255));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled({0,56}, {60, win_size.y}, IM_COL32(20,20,20,255));
 
-    ImGui::SetCursorPos(ImVec2(10, 66));
+    ImGui::SetCursorPos({10, 66});
     ImGui::BeginGroup();
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 8));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(0, 4));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {8, 8});
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  {0, 4});
 
-    // Select
-    bool sel = (g_state.current_tool == AppState::TOOL_SELECT);
-    if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.6f, 1.0f, 0.3f));
-    if (ImGui::Button("V", ImVec2(40, 40))) g_state.current_tool = AppState::TOOL_SELECT;
-    if (sel) ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Select Tool (V)");
+    auto toolBtn = [&](const char* label, AppState::Tool tool,
+                        ImVec4 active_col, const char* tooltip) {
+        bool active = (g_state.current_tool == tool);
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, active_col);
+        if (ImGui::Button(label, {40,40})) g_state.current_tool = tool;
+        if (active) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+    };
 
-    // Hand
-    bool hand = (g_state.current_tool == AppState::TOOL_HAND);
-    if (hand) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.6f, 1.0f, 0.3f));
-    if (ImGui::Button("H", ImVec2(40, 40))) g_state.current_tool = AppState::TOOL_HAND;
-    if (hand) ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hand Tool (H)");
-
-    // Segment
-    bool seg = (g_state.current_tool == AppState::TOOL_SEGMENT);
-    if (seg) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 1.0f, 0.6f, 0.3f));
-    if (ImGui::Button("S", ImVec2(40, 40))) g_state.current_tool = AppState::TOOL_SEGMENT;
-    if (seg) ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Segment Tool (S)\nLeft = foreground\nRight = background\nEnter = extract\nEsc = cancel");
+    toolBtn("V", AppState::TOOL_SELECT,  {0.4f,0.6f,1.0f,0.3f}, "Select (V)");
+    toolBtn("H", AppState::TOOL_HAND,    {0.4f,0.6f,1.0f,0.3f}, "Hand (H)");
+    toolBtn("S", AppState::TOOL_SEGMENT, {0.4f,1.0f,0.6f,0.3f},
+            "Segment (S)\nLeft=FG  Right=BG\nEnter=extract  Esc=cancel");
+    toolBtn("T", AppState::TOOL_TEXT,    {1.0f,0.8f,0.3f,0.3f},
+            "Text (T)\nClick to place\nDouble-click to edit\nDelete to remove");
 
     ImGui::PopStyleVar(2);
     ImGui::EndGroup();
 
-    // Status indicators
+    // Segment status
     if (g_state.is_encoding) {
-        ImGui::SetCursorPos(ImVec2(5, 210));
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "enc..");
+        ImGui::SetCursorPos({4, 250});
+        ImGui::TextColored({1.f,0.8f,0.2f,1.f}, "enc..");
     } else if (g_state.image_encoded && !g_state.prompt_points.empty()) {
-        ImGui::SetCursorPos(ImVec2(5, 210));
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "%dpt",
+        ImGui::SetCursorPos({4, 250});
+        ImGui::TextColored({0.4f,1.f,0.6f,1.f}, "%dpt",
                            (int)g_state.prompt_points.size());
     }
 
-    // Keyboard shortcuts
+    // Keyboard shortcuts (only when not typing text)
     ImGuiIO& io = ImGui::GetIO();
-    if (!io.WantCaptureKeyboard) {
+    if (!io.WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_state.current_tool = AppState::TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_state.current_tool = AppState::TOOL_HAND;
         if (ImGui::IsKeyPressed(ImGuiKey_S)) g_state.current_tool = AppState::TOOL_SEGMENT;
+        if (ImGui::IsKeyPressed(ImGuiKey_T)) {
+            g_state.current_tool = AppState::TOOL_TEXT;
+            g_state.text_state.panel_open = true;
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void RenderCanvas(ImDrawList* draw_list, ImVec2 canvas_pos, ImVec2 canvas_size,
-                  ImVec2& pan_offset, float& zoom_level)
+// RenderCanvas
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
+                  ImVec2& pan, float& zoom)
 {
-    ImVec2 canvas_min = canvas_pos;
-    ImVec2 canvas_max = ImVec2(canvas_pos.x + canvas_size.x,
-                               canvas_pos.y + canvas_size.y);
+    ImVec2 cmin = canvas_pos;
+    ImVec2 cmax = {canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y};
 
-    draw_list->AddRectFilled(canvas_min, canvas_max, IM_COL32(25, 25, 25, 255));
+    dl->AddRectFilled(cmin, cmax, IM_COL32(25,25,25,255));
 
     // Grid
-    const float grid_size  = 50.0f * zoom_level;
-    const ImU32 grid_color = IM_COL32(40, 40, 40, 255);
-    float sx0 = canvas_min.x + fmodf(pan_offset.x * zoom_level, grid_size);
-    float sy0 = canvas_min.y + fmodf(pan_offset.y * zoom_level, grid_size);
-    for (float x = sx0; x < canvas_max.x; x += grid_size)
-        draw_list->AddLine(ImVec2(x, canvas_min.y), ImVec2(x, canvas_max.y), grid_color);
-    for (float y = sy0; y < canvas_max.y; y += grid_size)
-        draw_list->AddLine(ImVec2(canvas_min.x, y), ImVec2(canvas_max.x, y), grid_color);
+    float gs  = 50.f * zoom;
+    float sx0 = cmin.x + fmodf(pan.x * zoom, gs);
+    float sy0 = cmin.y + fmodf(pan.y * zoom, gs);
+    ImU32 gc  = IM_COL32(40,40,40,255);
+    for (float x = sx0; x < cmax.x; x += gs) dl->AddLine({x,cmin.y},{x,cmax.y},gc);
+    for (float y = sy0; y < cmax.y; y += gs) dl->AddLine({cmin.x,y},{cmax.x,y},gc);
 
-    // Draw images + overlays
-    for (size_t i = 0; i < g_state.images.size(); i++) {
+    // Helper: world → screen
+    auto w2s = [&](ImVec2 wp) -> ImVec2 {
+        return {
+            cmin.x + canvas_size.x*0.5f + (wp.x + pan.x) * zoom,
+            cmin.y + canvas_size.y*0.5f + (wp.y + pan.y) * zoom
+        };
+    };
+
+    // ── Draw images ───────────────────────────────────────────────────────────
+    for (int i = 0; i < (int)g_state.images.size(); i++) {
         CanvasImage& img = g_state.images[i];
+        ImVec2 sp    = w2s(img.transform.position);
+        ImVec2 sp_br = {
+            sp.x + img.size.x * img.transform.scale * zoom,
+            sp.y + img.size.y * img.transform.scale * zoom
+        };
 
-        ImVec2 screen_pos = ImVec2(
-            canvas_min.x + canvas_size.x * 0.5f + (img.position.x + pan_offset.x) * zoom_level,
-            canvas_min.y + canvas_size.y * 0.5f + (img.position.y + pan_offset.y) * zoom_level
-        );
-        ImVec2 screen_size = ImVec2(
-            img.size.x * img.scale * zoom_level,
-            img.size.y * img.scale * zoom_level
-        );
-        ImVec2 screen_br = ImVec2(screen_pos.x + screen_size.x,
-                                  screen_pos.y + screen_size.y);
+        // UV flip for mirror
+        ImVec2 uv0 = img.transform.mirrored ? ImVec2(1,0) : ImVec2(0,0);
+        ImVec2 uv1 = img.transform.mirrored ? ImVec2(0,1) : ImVec2(1,1);
+        dl->AddImage((ImTextureID)(intptr_t)img.texture_id, sp, sp_br, uv0, uv1);
 
-        draw_list->AddImage((void*)(intptr_t)img.texture_id, screen_pos, screen_br);
-
-        // Mask overlay for active segment
-        if ((int)i == g_state.seg_image_index && g_state.overlay_texture) {
-            draw_list->AddImage((void*)(intptr_t)g_state.overlay_texture,
-                                screen_pos, screen_br);
-        }
+        // Segment overlay
+        if (i == g_state.seg_image_index && g_state.overlay_texture)
+            dl->AddImage((ImTextureID)(intptr_t)g_state.overlay_texture, sp, sp_br);
 
         // Prompt points
-        if ((int)i == g_state.seg_image_index) {
+        if (i == g_state.seg_image_index) {
             for (const auto& pt : g_state.prompt_points) {
-                float px = screen_pos.x + pt.x * img.scale * zoom_level;
-                float py = screen_pos.y + pt.y * img.scale * zoom_level;
-                ImU32 col = (pt.label == 1)
-                    ? IM_COL32(50, 220, 80, 255)
-                    : IM_COL32(220, 60, 60, 255);
-                draw_list->AddCircleFilled(ImVec2(px, py), 6.0f * zoom_level, col);
-                draw_list->AddCircle(ImVec2(px, py), 6.0f * zoom_level,
-                                     IM_COL32(255, 255, 255, 200), 12, 1.5f);
+                ImVec2 pp = {
+                    sp.x + pt.x * img.transform.scale * zoom,
+                    sp.y + pt.y * img.transform.scale * zoom
+                };
+                ImU32 col = pt.label ? IM_COL32(50,220,80,255) : IM_COL32(220,60,60,255);
+                dl->AddCircleFilled(pp, 6.f*zoom, col);
+                dl->AddCircle(pp, 6.f*zoom, IM_COL32(255,255,255,200), 12, 1.5f);
             }
         }
 
+        // Transform handles for selected image
         if (img.selected) {
-            draw_list->AddRect(screen_pos, screen_br,
-                               IM_COL32(100, 150, 255, 255), 0, 0, 2.0f);
+            DragState& drag = g_state.image_drags[i];
+            TransformHandles::update(dl, img.transform, img.size,
+                                     drag, zoom, pan, cmin, canvas_size);
+            if (TransformHandles::mirrorButton(dl, img.transform, img.size,
+                                               zoom, pan, cmin, canvas_size))
+                img.transform.mirrored = !img.transform.mirrored;
         }
     }
 
-    // Encoding spinner (rotating arc)
+    // Encoding spinner
     if (g_state.is_encoding) {
-        ImVec2 center = ImVec2(canvas_min.x + canvas_size.x * 0.5f,
-                               canvas_min.y + canvas_size.y * 0.5f);
-        float t = (float)glfwGetTime();
-        float r = 24.0f;
-        draw_list->AddCircle(center, r, IM_COL32(60, 60, 60, 200), 32, 3.0f);
+        ImVec2 ctr = {cmin.x + canvas_size.x*0.5f, cmin.y + canvas_size.y*0.5f};
+        float t = (float)glfwGetTime(), r = 24.f;
+        dl->AddCircle(ctr, r, IM_COL32(60,60,60,200), 32, 3.f);
         for (int j = 0; j < 8; j++) {
-            float angle = t * 3.0f + j * (3.14159f * 2.0f / 8.0f);
-            float alpha = (float)j / 8.0f * 180.0f;
-            draw_list->AddCircleFilled(
-                ImVec2(center.x + cosf(angle) * r, center.y + sinf(angle) * r),
-                3.5f, IM_COL32(80, 180, 255, (int)alpha));
+            float a = t*3.f + j*(3.14159f*2.f/8.f);
+            dl->AddCircleFilled({ctr.x+cosf(a)*r, ctr.y+sinf(a)*r},
+                3.5f, IM_COL32(80,180,255,(int)(j/8.f*180)+40));
         }
-        draw_list->AddText(ImVec2(center.x - 28.f, center.y + r + 8.f),
-                           IM_COL32(180, 180, 180, 255), "Encoding...");
+        dl->AddText({ctr.x-32.f, ctr.y+r+8.f}, IM_COL32(180,180,180,255), "Encoding...");
     }
 
-    // Crosshair at origin
-    ImVec2 origin = ImVec2(
-        canvas_min.x + canvas_size.x * 0.5f + pan_offset.x * zoom_level,
-        canvas_min.y + canvas_size.y * 0.5f + pan_offset.y * zoom_level
-    );
-    draw_list->AddLine(ImVec2(origin.x - 10, origin.y), ImVec2(origin.x + 10, origin.y),
-                       IM_COL32(100, 150, 255, 255), 2.0f);
-    draw_list->AddLine(ImVec2(origin.x, origin.y - 10), ImVec2(origin.x, origin.y + 10),
-                       IM_COL32(100, 150, 255, 255), 2.0f);
+    // Always draw all text (visible in every tool mode)
+    TextTool::drawAllText(g_state.texts, dl, cmin, canvas_size, pan, zoom);
+
+    // Crosshair at world origin
+    ImVec2 orig = w2s({0,0});
+    dl->AddLine({orig.x-10,orig.y},{orig.x+10,orig.y}, IM_COL32(100,150,255,255), 2.f);
+    dl->AddLine({orig.x,orig.y-10},{orig.x,orig.y+10}, IM_COL32(100,150,255,255), 2.f);
 
     // ── Input ─────────────────────────────────────────────────────────────────
     ImGuiIO& io = ImGui::GetIO();
-    bool in_canvas = ImGui::IsMouseHoveringRect(canvas_min, canvas_max);
+    bool in_canvas = ImGui::IsMouseHoveringRect(cmin, cmax);
 
     if (in_canvas) {
-        // ── Zoom toward cursor ────────────────────────────────────────────────
-        if (io.MouseWheel != 0.0f) {
-            float old_zoom = zoom_level;
-            zoom_level = std::max(0.1f, std::min(5.0f, zoom_level + io.MouseWheel * 0.1f));
-            float zoom_ratio = zoom_level / old_zoom;
-
-            // Mouse position relative to canvas centre
-            float mx = io.MousePos.x - (canvas_min.x + canvas_size.x * 0.5f);
-            float my = io.MousePos.y - (canvas_min.y + canvas_size.y * 0.5f);
-
-            // Adjust pan so the point under the cursor stays fixed
-            pan_offset.x = mx / zoom_level - mx / old_zoom + pan_offset.x * zoom_ratio / zoom_ratio;
-            pan_offset.y = my / zoom_level - my / old_zoom + pan_offset.y * zoom_ratio / zoom_ratio;
-
-            // Simplified correct form:
-            pan_offset.x += (mx / zoom_level - mx / old_zoom);
-            pan_offset.y += (my / zoom_level - my / old_zoom);
+        // Zoom toward cursor
+        if (io.MouseWheel != 0.f) {
+            float old_zoom = zoom;
+            zoom = std::max(0.1f, std::min(5.f, zoom + io.MouseWheel * 0.1f));
+            float mx = io.MousePos.x - (cmin.x + canvas_size.x * 0.5f);
+            float my = io.MousePos.y - (cmin.y + canvas_size.y * 0.5f);
+            pan.x += mx/zoom - mx/old_zoom;
+            pan.y += my/zoom - my/old_zoom;
         }
 
         // Mouse → world space
-        ImVec2 mouse_world = ImVec2(
-            (io.MousePos.x - canvas_min.x - canvas_size.x * 0.5f) / zoom_level - pan_offset.x,
-            (io.MousePos.y - canvas_min.y - canvas_size.y * 0.5f) / zoom_level - pan_offset.y
-        );
+        ImVec2 mw = {
+            (io.MousePos.x - cmin.x - canvas_size.x*0.5f) / zoom - pan.x,
+            (io.MousePos.y - cmin.y - canvas_size.y*0.5f) / zoom - pan.y
+        };
+
+        // ── Text tool ─────────────────────────────────────────────────────────
+        if (g_state.current_tool == AppState::TOOL_TEXT) {
+            TextTool::update(g_state.texts, g_state.text_state,
+                             dl, cmin, canvas_size, pan, zoom, mw, in_canvas);
 
         // ── Select tool ───────────────────────────────────────────────────────
-        if (g_state.current_tool == AppState::TOOL_SELECT) {
+        } else if (g_state.current_tool == AppState::TOOL_SELECT) {
+
             if (ImGui::IsMouseClicked(0)) {
-                g_state.selected_image_index = -1;
-                for (int i = (int)g_state.images.size() - 1; i >= 0; i--) {
-                    CanvasImage& img = g_state.images[i];
-                    if (mouse_world.x >= img.position.x &&
-                        mouse_world.x <= img.position.x + img.size.x * img.scale &&
-                        mouse_world.y >= img.position.y &&
-                        mouse_world.y <= img.position.y + img.size.y * img.scale)
-                    {
-                        g_state.selected_image_index = i;
-                        g_state.is_dragging_image    = true;
-                        g_state.drag_start_pos       = mouse_world;
-                        img.selected = true;
+                // Check if a corner handle was just activated this click
+                // (TransformHandles::update sets drag.active inside the draw loop above)
+                bool handle_just_activated = false;
+                if (g_state.selected_image_index >= 0) {
+                    auto it = g_state.image_drags.find(g_state.selected_image_index);
+                    if (it != g_state.image_drags.end())
+                        handle_just_activated = (it->second.active != HandleId::None);
+                }
+
+                if (!handle_just_activated) {
+                    // Find which image was clicked
+                    int new_sel = -1;
+                    for (int i = (int)g_state.images.size()-1; i >= 0; i--) {
+                        CanvasImage& img = g_state.images[i];
+                        float x0 = img.transform.position.x;
+                        float y0 = img.transform.position.y;
+                        float x1 = x0 + img.size.x * img.transform.scale;
+                        float y1 = y0 + img.size.y * img.transform.scale;
+                        if (mw.x>=x0 && mw.x<=x1 && mw.y>=y0 && mw.y<=y1) {
+                            new_sel = i; break;
+                        }
+                    }
+
+                    // Deselect all
+                    for (auto& img : g_state.images) img.selected = false;
+                    g_state.selected_image_index = new_sel;
+
+                    if (new_sel >= 0) {
+                        g_state.images[new_sel].selected = true;
+                        // Only start image drag if NOT clicking a handle area
+                        // (handle areas are ~10px from corners in screen space,
+                        //  but we can't easily check that here — so we defer:
+                        //  drag starts next frame if drag.active is still None)
+                        g_state.is_dragging_image = true;
+                        g_state.drag_start_pos    = mw;
                     } else {
-                        img.selected = false;
+                        g_state.is_dragging_image = false;
                     }
                 }
             }
+
+            // Drag move — only when no handle is active
             if (g_state.is_dragging_image && g_state.selected_image_index >= 0) {
+                // Use find() not operator[] — operator[] inserts a default DragState
+                // with active=None, making handle detection always fail
+                auto drag_it = g_state.image_drags.find(g_state.selected_image_index);
+                bool handle_active = (drag_it != g_state.image_drags.end() &&
+                                      drag_it->second.active != HandleId::None);
                 if (ImGui::IsMouseDown(0)) {
-                    CanvasImage& img = g_state.images[g_state.selected_image_index];
-                    img.position.x += mouse_world.x - g_state.drag_start_pos.x;
-                    img.position.y += mouse_world.y - g_state.drag_start_pos.y;
-                    g_state.drag_start_pos = mouse_world;
+                    if (!handle_active) {
+                        // Normal image move
+                        CanvasImage& img = g_state.images[g_state.selected_image_index];
+                        img.transform.position.x += mw.x - g_state.drag_start_pos.x;
+                        img.transform.position.y += mw.y - g_state.drag_start_pos.y;
+                        g_state.drag_start_pos = mw;
+                    } else {
+                        // Handle active — keep drag_start_pos in sync so no jump on release
+                        g_state.drag_start_pos = mw;
+                    }
                 } else {
                     g_state.is_dragging_image = false;
                 }
             }
 
-            // Delete selected image with Delete/Backspace
-            if (g_state.selected_image_index >= 0 &&
+            // Delete key
+            if (g_state.selected_image_index >= 0 && !io.WantTextInput &&
                 (ImGui::IsKeyPressed(ImGuiKey_Delete) ||
                  ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
-                glDeleteTextures(1, &g_state.images[g_state.selected_image_index].texture_id);
+                glDeleteTextures(1,
+                    &g_state.images[g_state.selected_image_index].texture_id);
                 g_state.images.erase(g_state.images.begin() + g_state.selected_image_index);
+                g_state.image_drags.erase(g_state.selected_image_index);
                 g_state.selected_image_index = -1;
             }
 
         // ── Hand tool ─────────────────────────────────────────────────────────
         } else if (g_state.current_tool == AppState::TOOL_HAND) {
-            bool should_pan = ImGui::IsMouseDown(0) || ImGui::IsMouseDown(2);
-            if (should_pan) {
+            if (ImGui::IsMouseDown(0) || ImGui::IsMouseDown(2)) {
                 if (!g_state.is_panning) {
                     g_state.is_panning     = true;
                     g_state.last_mouse_pos = io.MousePos;
                 }
-                pan_offset.x += (io.MousePos.x - g_state.last_mouse_pos.x) / zoom_level;
-                pan_offset.y += (io.MousePos.y - g_state.last_mouse_pos.y) / zoom_level;
+                pan.x += (io.MousePos.x - g_state.last_mouse_pos.x) / zoom;
+                pan.y += (io.MousePos.y - g_state.last_mouse_pos.y) / zoom;
                 g_state.last_mouse_pos = io.MousePos;
             } else {
                 g_state.is_panning = false;
@@ -680,87 +661,55 @@ void RenderCanvas(ImDrawList* draw_list, ImVec2 canvas_pos, ImVec2 canvas_size,
 
         // ── Segment tool ──────────────────────────────────────────────────────
         } else if (g_state.current_tool == AppState::TOOL_SEGMENT) {
+            bool fg = ImGui::IsMouseClicked(0);
+            bool bg = ImGui::IsMouseClicked(1);
 
-            bool clicked_fg = ImGui::IsMouseClicked(0);
-            bool clicked_bg = ImGui::IsMouseClicked(1);
-
-            if ((clicked_fg || clicked_bg) && !g_state.is_encoding) {
-                for (int i = (int)g_state.images.size() - 1; i >= 0; i--) {
+            if ((fg || bg) && !g_state.is_encoding) {
+                for (int i = (int)g_state.images.size()-1; i >= 0; i--) {
                     CanvasImage& img = g_state.images[i];
-                    float x1 = img.position.x;
-                    float y1 = img.position.y;
-                    float x2 = img.position.x + img.size.x * img.scale;
-                    float y2 = img.position.y + img.size.y * img.scale;
-
-                    if (mouse_world.x < x1 || mouse_world.x > x2 ||
-                        mouse_world.y < y1 || mouse_world.y > y2) continue;
-
-                    if (img.pixels.empty()) { printf("[Segment] No pixel data.\n"); break; }
+                    float x0 = img.transform.position.x, y0 = img.transform.position.y;
+                    float x1 = x0+img.size.x*img.transform.scale;
+                    float y1 = y0+img.size.y*img.transform.scale;
+                    if (mw.x<x0||mw.x>x1||mw.y<y0||mw.y>y1) continue;
+                    if (img.pixels.empty()) break;
                     if (!g_segmenter.isReady()) {
-                        g_state.status_msg   = "Models not loaded!";
-                        g_state.status_timer = 3.0f;
-                        break;
+                        g_state.status_msg="Models not loaded!"; g_state.status_timer=3.f; break;
                     }
 
-                    // Switching to a new image → async encode
                     if (i != g_state.seg_image_index) {
-                        // Wait for previous encode if running
-                        if (g_state.encode_thread.joinable())
-                            g_state.encode_thread.join();
-
+                        if (g_state.encode_thread.joinable()) g_state.encode_thread.join();
                         g_state.prompt_points.clear();
                         g_state.seg_image_index = i;
-                        g_state.image_encoded   = false;
-                        g_state.encode_ok       = false;
+                        g_state.image_encoded = false;
+                        g_state.encode_ok = false;
                         if (g_state.overlay_texture) {
                             glDeleteTextures(1, &g_state.overlay_texture);
                             g_state.overlay_texture = 0;
                         }
+                        g_state.is_encoding = true;
+                        g_state.encode_done = false;
 
-                        g_state.is_encoding  = true;
-                        g_state.encode_done  = false;
-
-                        // Capture data for thread
-                        const uint8_t* px_ptr = img.pixels.data();
-                        int iw = (int)img.size.x, ih = (int)img.size.y;
-
-                        g_state.encode_thread = std::thread([px_ptr, iw, ih]() {
-                            bool ok = g_segmenter.encodeImage(px_ptr, iw, ih);
-                            g_state.encode_ok   = ok;
+                        const uint8_t* px = img.pixels.data();
+                        int iw=(int)img.size.x, ih=(int)img.size.y;
+                        g_state.encode_thread = std::thread([px,iw,ih](){
+                            g_state.encode_ok   = g_segmenter.encodeImage(px,iw,ih);
                             g_state.encode_done = true;
                         });
-
-                        // Queue the click point — will be decoded once encode finishes
-                        float local_x = (mouse_world.x - x1) / img.scale;
-                        float local_y = (mouse_world.y - y1) / img.scale;
-                        g_state.prompt_points.push_back({local_x, local_y, clicked_fg ? 1 : 0});
-                        g_state.status_msg   = "Encoding image...";
-                        g_state.status_timer = 60.0f; // hold until encode done
-                        break;
+                        g_state.status_msg="Encoding image..."; g_state.status_timer=60.f;
                     }
 
-                    // Same image — add point and decode immediately
-                    float local_x = (mouse_world.x - x1) / img.scale;
-                    float local_y = (mouse_world.y - y1) / img.scale;
-                    int   label   = clicked_fg ? 1 : 0;
+                    float lx = (mw.x-x0)/img.transform.scale;
+                    float ly = (mw.y-y0)/img.transform.scale;
+                    g_state.prompt_points.push_back({lx, ly, fg?1:0});
 
-                    g_state.prompt_points.push_back({local_x, local_y, label});
-                    printf("[Segment] Added %s point (%.1f, %.1f), total=%d\n",
-                           label ? "FG" : "BG", local_x, local_y,
-                           (int)g_state.prompt_points.size());
-
-                    SegmentResult result = g_segmenter.decode(g_state.prompt_points);
-                    QueueOverlay(result);
+                    if (g_state.image_encoded)
+                        QueueOverlay(g_segmenter.decode(g_state.prompt_points));
                     break;
                 }
             }
 
-            // Enter = commit extraction
-            if (ImGui::IsKeyPressed(ImGuiKey_Enter) && g_state.image_encoded) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Enter) && g_state.image_encoded)
                 CommitExtraction();
-            }
-
-            // Escape = cancel
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
                 g_state.prompt_points.clear();
                 g_state.seg_image_index = -1;
@@ -769,18 +718,17 @@ void RenderCanvas(ImDrawList* draw_list, ImVec2 canvas_pos, ImVec2 canvas_size,
                     glDeleteTextures(1, &g_state.overlay_texture);
                     g_state.overlay_texture = 0;
                 }
-                printf("[Segment] Cancelled.\n");
             }
         }
 
-        // Space + drag = pan in any tool
+        // Space+drag = pan in any tool
         if (ImGui::IsKeyDown(ImGuiKey_Space) && ImGui::IsMouseDown(0)) {
             if (!g_state.is_panning) {
                 g_state.is_panning     = true;
                 g_state.last_mouse_pos = io.MousePos;
             }
-            pan_offset.x += (io.MousePos.x - g_state.last_mouse_pos.x) / zoom_level;
-            pan_offset.y += (io.MousePos.y - g_state.last_mouse_pos.y) / zoom_level;
+            pan.x += (io.MousePos.x - g_state.last_mouse_pos.x) / zoom;
+            pan.y += (io.MousePos.y - g_state.last_mouse_pos.y) / zoom;
             g_state.last_mouse_pos = io.MousePos;
         } else if (!ImGui::IsKeyDown(ImGuiKey_Space) &&
                    g_state.current_tool != AppState::TOOL_HAND) {
@@ -793,24 +741,23 @@ void RenderCanvas(ImDrawList* draw_list, ImVec2 canvas_pos, ImVec2 canvas_size,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-GLuint LoadTextureFromFile(const char* filename, int* out_width, int* out_height,
+// Texture helpers
+// ─────────────────────────────────────────────────────────────────────────────
+GLuint LoadTextureFromFile(const char* filename, int* out_w, int* out_h,
                            std::vector<unsigned char>& out_pixels)
 {
     int w, h, ch;
     unsigned char* data = stbi_load(filename, &w, &h, &ch, 4);
-    if (!data) { fprintf(stderr, "Failed to load: %s\n", filename); return 0; }
-
-    out_pixels.assign(data, data + w * h * 4);
-
+    if (!data) { fprintf(stderr,"Failed to load: %s\n", filename); return 0; }
+    out_pixels.assign(data, data + w*h*4);
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-
     stbi_image_free(data);
-    *out_width = w; *out_height = h;
+    *out_w = w; *out_h = h;
     return tex;
 }
 
@@ -821,20 +768,19 @@ GLuint CreateTextureFromPixels(const std::vector<unsigned char>& pixels, int w, 
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
     return tex;
 }
 
 void UpdateTextureFromPixels(GLuint tex_id, const std::vector<unsigned char>& pixels, int w, int h)
 {
     glBindTexture(GL_TEXTURE_2D, tex_id);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glTexSubImage2D(GL_TEXTURE_2D,0,0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
 }
 
 void ApplyMaskToPixels(std::vector<unsigned char>& pixels,
-                       const std::vector<uint8_t>& mask, int width, int height)
+                       const std::vector<uint8_t>& mask, int w, int h)
 {
-    for (int i = 0; i < width * height; i++) {
-        if (mask[i] == 0) pixels[i * 4 + 3] = 0;
-    }
+    for (int i = 0; i < w*h; i++)
+        if (mask[i] == 0) pixels[i*4+3] = 0;
 }
