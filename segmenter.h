@@ -3,7 +3,15 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include <onnxruntime_cxx_api.h>
+#include <cstdint>
+
+// No onnxruntime_cxx_api.h include here on purpose — the actual ONNX
+// Runtime types live behind Impl (pimpl idiom), defined only in
+// segmenter.cpp (native) / segmenter_web.cpp (web, ONNX Runtime Web via a
+// JS bridge instead). That's what lets this one header + this one class
+// declaration serve both platforms with completely different Impls behind
+// it, same as Platform::OpenImageFile/SaveFile — main.cpp using Segmenter
+// never needs to know or care which backend is compiled in.
 
 // ── Point prompt ─────────────────────────────────────────────────────────────
 struct PromptPoint {
@@ -37,7 +45,7 @@ struct SegmentResult {
 class Segmenter {
 public:
     Segmenter();
-    ~Segmenter() = default;
+    ~Segmenter(); // defined in the .cpp, where Impl is a complete type
 
     // Load both ONNX models. Returns false on failure.
     bool loadModels(const std::string& encoder_path,
@@ -58,12 +66,10 @@ public:
     int  imageHeight() const { return image_h_; }
 
 private:
-    // ── ONNX Runtime ─────────────────────────────────────────────────────────
-    Ort::Env            env_;
-    Ort::SessionOptions session_opts_;
-
-    std::unique_ptr<Ort::Session> encoder_session_;
-    std::unique_ptr<Ort::Session> decoder_session_;
+    // ── ONNX Runtime (native) / ONNX Runtime Web (web) ─────────────────────────
+    // Opaque — see the platform-specific .cpp for what's actually inside.
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 
     bool encoder_ready_ = false;
     bool decoder_ready_ = false;

@@ -1,4 +1,5 @@
 #include "segmenter.h"
+#include <onnxruntime_cxx_api.h>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -12,21 +13,31 @@ static constexpr int   kEmbedH  = 64;
 static constexpr int   kEmbedW  = 64;
 static constexpr int   kEmbedC  = 256;
 
+// ── Impl — the actual ONNX Runtime state, hidden from segmenter.h ────────────
+struct Segmenter::Impl {
+    Ort::Env            env{ORT_LOGGING_LEVEL_WARNING, "Segmenter"};
+    Ort::SessionOptions session_opts;
+
+    std::unique_ptr<Ort::Session> encoder_session;
+    std::unique_ptr<Ort::Session> decoder_session;
+
+    Impl() {
+        session_opts.SetIntraOpNumThreads(4);
+        session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
-Segmenter::Segmenter()
-    : env_(ORT_LOGGING_LEVEL_WARNING, "Segmenter")
-{
-    session_opts_.SetIntraOpNumThreads(4);
-    session_opts_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-}
+Segmenter::Segmenter() : impl_(std::make_unique<Impl>()) {}
+Segmenter::~Segmenter() = default;
 
 // ─────────────────────────────────────────────────────────────────────────────
 bool Segmenter::loadModels(const std::string& encoder_path,
                            const std::string& decoder_path)
 {
     try {
-        encoder_session_ = std::make_unique<Ort::Session>(
-            env_, encoder_path.c_str(), session_opts_);
+        impl_->encoder_session = std::make_unique<Ort::Session>(
+            impl_->env, encoder_path.c_str(), impl_->session_opts);
         encoder_ready_ = true;
         printf("[Segmenter] Encoder loaded: %s\n", encoder_path.c_str());
     } catch (const Ort::Exception& e) {
@@ -35,8 +46,8 @@ bool Segmenter::loadModels(const std::string& encoder_path,
     }
 
     try {
-        decoder_session_ = std::make_unique<Ort::Session>(
-            env_, decoder_path.c_str(), session_opts_);
+        impl_->decoder_session = std::make_unique<Ort::Session>(
+            impl_->env, decoder_path.c_str(), impl_->session_opts);
         decoder_ready_ = true;
         printf("[Segmenter] Decoder loaded: %s\n", decoder_path.c_str());
     } catch (const Ort::Exception& e) {
@@ -124,7 +135,7 @@ bool Segmenter::encodeImage(const uint8_t* pixels_rgba, int width, int height)
     const char* output_names[] = {"image_embeddings"};
 
     try {
-        auto outputs = encoder_session_->Run(
+        auto outputs = impl_->encoder_session->Run(
             Ort::RunOptions{nullptr},
             input_names,  &input_tensor, 1,
             output_names, 1);
@@ -246,7 +257,7 @@ SegmentResult Segmenter::decode(const std::vector<PromptPoint>& points)
     inputs.push_back(std::move(orig_size_tensor));
 
     try {
-        auto outputs = decoder_session_->Run(
+        auto outputs = impl_->decoder_session->Run(
             Ort::RunOptions{nullptr},
             input_names, inputs.data(), inputs.size(),
             output_names, 3);
