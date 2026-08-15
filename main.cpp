@@ -350,13 +350,6 @@ void RenderTopBar(ImVec2 win_size)
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {12, 8});
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  {4, 0});
 
-    if (ImGui::Button("File")) {}
-    ImGui::SameLine();
-    if (ImGui::Button("Edit")) {}
-    ImGui::SameLine();
-    if (ImGui::Button("View")) {}
-    ImGui::SameLine();
-
     // Load image
     if (ImGui::Button("Image")) {
         const char* filters[] = {"*.png","*.jpg","*.jpeg","*.bmp"};
