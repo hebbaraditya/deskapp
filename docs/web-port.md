@@ -26,10 +26,12 @@ inference. See "Seams" below.
    stubbed out), including the CMake Emscripten toolchain path — folded into
    this stage rather than done separately, since there was no way to
    meaningfully test one without the other anyway.
-4. ONNX Runtime Web integration for MobileSAM segmentation — hardest,
-   most isolated piece, tackled on its own now that everything else works.
+4. **[DONE]** ONNX Runtime Web integration for MobileSAM segmentation.
 5. Cloudflare Pages deployment, including COOP/COEP headers (needed for
-   `SharedArrayBuffer`/threading) via a `_headers` file.
+   real `std::thread`/`SharedArrayBuffer` support down the line — not
+   required for what's working today, see stage 4 log) via a `_headers`
+   file, plus self-hosting onnxruntime-web's dist files instead of the
+   CDN this currently depends on.
 
 ## Seams (native → web)
 
@@ -144,4 +146,95 @@ This was the big one. In order:
 Native build re-verified working after every one of the above changes —
 nothing here touched native behavior.
 
-**Next:** stage 4, ONNX Runtime Web integration for MobileSAM.
+## Stage 4 log — MobileSAM segmentation running in-browser (done)
+
+The core problem going in: `ort.InferenceSession.run()` in ONNX Runtime Web
+is a JS Promise (async) — there's no synchronous WASM-native ORT API to
+link against like native's `onnxruntime_cxx_api.h`. To keep `Segmenter`'s
+public API identical on both platforms (the promise stage 3's commit
+message made), used **Asyncify** (`-sASYNCIFY=1`): lets a JS `async
+function`, declared via `EM_ASYNC_JS`, be called from C++ as an ordinary
+blocking call — the WASM stack transparently unwinds while the Promise is
+pending and resumes when it resolves.
+
+1. **Extracted `Segmenter`'s pure-math methods** (`preprocess()` — RGBA to
+   normalised tensor, `upscaleMask()` — bilinear mask resize) into a new
+   shared `segmenter_math.cpp`, compiled into both builds. Neither method
+   touches ORT types, so this was pure code motion, no logic changes.
+   Model I/O shape constants (`kSAMSize`/`kEmbedC/H/W`) moved from
+   `segmenter.cpp` into `segmenter.h` so both `segmenter.cpp` and
+   `segmenter_web.cpp` share one definition instead of redeclaring them.
+2. **Real `segmenter_web.cpp`**, replacing the stage-3 stub: three
+   `EM_ASYNC_JS` bridge functions —
+   - `web_load_models(encoder_url, decoder_url)` — `ort.InferenceSession
+     .create()` for both, stashed on `Module`. Returns a bitmask so
+     `loadModels()` can report per-model failures like native's two
+     separate `try`/`catch` blocks do.
+   - `web_run_encoder(input_ptr, input_len)` — wraps the WASM-memory
+     region at `input_ptr` directly as a `Float32Array` view (no copy),
+     runs the encoder, copies the output embedding into a `_malloc`'d
+     WASM buffer, returns that pointer for C++ to read and free.
+   - `web_run_decoder(...)` — same pattern for point-coords/labels in,
+     mask+IoU out (scalar outputs via WASM-memory out-pointers, i.e. JS
+     writes into `HEAP32`/`HEAPF32` at addresses C++ passed in).
+
+   `embedding_`, `image_encoded_`, `image_w_`/`image_h_` are plain
+   `Segmenter` members (no ORT dependency) already, so they just work
+   as the interchange buffer between `encodeImage()` and `decode()`
+   on web exactly like they already did on native.
+3. **onnxruntime-web loaded via CDN** (`shell_minimal.html`), pinned to
+   `1.27.0` (verified against the actual published npm version, not
+   guessed) rather than `@latest`, so a future upstream release can't
+   silently change behavior underneath us. Self-hosting this is a stage-5
+   TODO — CDN dependency is fine for local testing, not for a real deploy.
+4. **First real build linked clean**, but two runtime bugs surfaced only
+   once actually exercised in-browser (confirmed via the user checking
+   DevTools console each time — no Accessibility permission on this
+   machine to drive DevTools automatically):
+   - `Module._malloc is not a function`, thrown from `platform_web.cpp`'s
+     file-open flow. Root cause, confirmed by inspecting the actual
+     generated `yoinkboard.js`: `_malloc`/`_free`/`HEAPU8`/`HEAPF32`/
+     `HEAP32` exist as bare closure-scope variables inside the generated
+     JS, **not** also mirrored onto the `Module` object — unlike
+     `EMSCRIPTEN_KEEPALIVE`-exported C functions (like our own
+     `yoinkboard_web_image_loaded`), which *are* attached to `Module`.
+     `EM_JS`/`EM_ASYNC_JS` bodies are inlined into that same closure
+     scope, so the fix was simply dropping the `Module.` prefix
+     everywhere in `platform_web.cpp` and `segmenter_web.cpp`.
+   - `thread constructor failed` / `Aborted(native code called abort())`,
+     crashing the moment segmentation was triggered. `main.cpp` spawns a
+     real `std::thread` to run the encode step off the render thread —
+     Emscripten's `std::thread` needs pthread support plus COOP/COEP
+     cross-origin isolation headers, neither of which are set up (that's
+     what stage 5's `_headers` file is for). Fixed by *not* spawning a
+     thread on web at all: `Segmenter::encodeImage()` is already
+     non-blocking-to-the-browser via Asyncify (it's backed by a JS
+     Promise under the hood), so `main.cpp` now branches on
+     `__EMSCRIPTEN__` to call it directly instead of wrapping it in
+     `std::thread(...)`. Native path (real thread) untouched.
+5. **Rebuilt — real segmentation confirmed working end-to-end**, visually,
+   in Chrome: loaded a 5120×2880 photo, pressed S, clicked the subject —
+   console showed `[Segmenter] Image encoded (5120x2880)` then
+   `[Segmenter] Decoded 5120x2880 IoU=1.020`, and the blue mask overlay
+   correctly followed the boundary between the subject and background.
+   Genuine client-side MobileSAM inference, no server involved.
+
+Native build re-verified working after every change in this stage too —
+the `segmenter_math.cpp` extraction and the `std::thread` branch both
+touch shared code, so this mattered more than usual here.
+
+**Known rough edges, left for stage 5 / later polish (not blockers):**
+- `g_segmenter.loadModels(...)` runs at startup and (via Asyncify) blocks
+  the canvas from rendering *anything* until it resolves — fine for
+  testing, bad UX for a real deploy (blank canvas during model download).
+  Should become lazy (load on first Segment-tool use) with a visible
+  loading state.
+- A harmless console warning — `emscripten_set_main_loop_timing: Cannot
+  set timing mode... call emscripten_set_main_loop first` — fires once
+  during the `ImGui_ImplGlfw_InstallEmscriptenCallbacks` canvas-resize
+  hookup, before the main loop technically exists yet (still inside the
+  Asyncify-suspended `loadModels()` call at that point). Doesn't affect
+  rendering or functionality; not yet root-caused further.
+- CDN dependency for onnxruntime-web (see point 3 above).
+
+**Next:** stage 5, Cloudflare Pages deployment.

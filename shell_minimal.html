@@ -3,7 +3,19 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no"/>
-    <title>Dear ImGui Emscripten example</title>
+    <title>Yoinkboard</title>
+    <!--
+      ONNX Runtime Web — runs the MobileSAM encoder/decoder client-side.
+      Pinned version (not @latest) so a future upstream release can't
+      silently change behavior underneath us. Loaded from CDN for now;
+      self-host these dist files before a real Cloudflare Pages deploy
+      (web-port stage 5) so the app doesn't depend on jsdelivr staying up.
+      wasmPaths tells it where to find its own WASM runtime files.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js"></script>
+    <script>
+      ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
+    </script>
     <style>
         body { margin: 0; background-color: black }
         /* FIXME: with our GLFW example this block seems to break resizing and io.DisplaySize gets stuck */

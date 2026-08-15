@@ -24,6 +24,7 @@ set(COMMON_SOURCES
     main.cpp
     text_tool.cpp
     stb_image_impl.cpp
+    segmenter_math.cpp
     ${IMGUI_SOURCES}
 )
 
@@ -56,6 +57,15 @@ if(EMSCRIPTEN)
         -sALLOW_MEMORY_GROWTH=1
         -sNO_EXIT_RUNTIME=0
         -sASSERTIONS=1
+        # Asyncify: lets segmenter_web.cpp's EM_ASYNC_JS calls (ONNX Runtime
+        # Web's InferenceSession.run() is a JS Promise) look like ordinary
+        # blocking C++ calls to the rest of the app — Segmenter's public API
+        # stays identical to native's synchronous one. Stack size bumped up
+        # from the 4KB default; our real call depth (main loop -> RenderCanvas
+        # -> segment tool -> Segmenter::decode -> web_run_decoder) is deeper
+        # than Asyncify's default budget expects.
+        -sASYNCIFY=1
+        -sASYNCIFY_STACK_SIZE=65536
         # Bundle fonts/ into the virtual filesystem at /fonts so
         # TextTool::loadFonts()'s existing fopen("fonts/...") calls resolve
         # unchanged — no code differences needed between native and web here.

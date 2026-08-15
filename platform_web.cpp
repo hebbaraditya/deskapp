@@ -1,8 +1,12 @@
-// NOTE: written against standard, well-documented Emscripten patterns
-// (EM_JS + malloc/free bridging), but not yet compiled or run — there's no
-// web build of the real app yet (that's web-port stage 3). First real test
-// happens then; expect to come back and adjust the exact JS glue/linker
-// flags (e.g. -sEXPORTED_RUNTIME_METHODS for _malloc/_free) once it does.
+// Bridges browser file I/O to Platform::OpenImageFile/SaveFile via EM_JS.
+// Note on _malloc/_free/HEAP*: reference them as bare identifiers, not
+// Module._malloc etc. — EM_JS bodies are inlined into the same generated-JS
+// closure scope as the runtime internals, where these exist as plain
+// closure-scope vars; they are NOT also mirrored onto the Module object
+// (unlike EMSCRIPTEN_KEEPALIVE-exported C functions, which are). Confirmed
+// against the actual generated output, not guessed — an earlier version of
+// this file used Module._malloc and failed at runtime with "Module._malloc
+// is not a function".
 
 #include "platform.h"
 
@@ -54,10 +58,10 @@ EM_JS(void, web_open_image_file, (), {
         var reader = new FileReader();
         reader.onload = function(e) {
             var bytes = new Uint8Array(e.target.result);
-            var ptr = Module._malloc(bytes.length);
-            Module.HEAPU8.set(bytes, ptr);
+            var ptr = _malloc(bytes.length);
+            HEAPU8.set(bytes, ptr);
             Module._yoinkboard_web_image_loaded(ptr, bytes.length);
-            Module._free(ptr);
+            _free(ptr);
         };
         reader.readAsArrayBuffer(file);
     };

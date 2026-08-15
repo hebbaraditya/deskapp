@@ -861,10 +861,24 @@ void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
 
                         const uint8_t* px = img.pixels.data();
                         int iw=(int)img.size.x, ih=(int)img.size.y;
+#ifdef __EMSCRIPTEN__
+                        // Real threads need pthread support + COOP/COEP
+                        // cross-origin isolation headers (deployment-stage
+                        // territory) — std::thread's constructor just aborts
+                        // without them. But we don't actually need a thread
+                        // here on web: Segmenter::encodeImage() is already
+                        // non-blocking-to-the-browser via Asyncify (it's
+                        // backed by a JS Promise under the hood), so calling
+                        // it directly already doesn't freeze the tab while
+                        // it runs.
+                        g_state.encode_ok   = g_segmenter.encodeImage(px, iw, ih);
+                        g_state.encode_done = true;
+#else
                         g_state.encode_thread = std::thread([px,iw,ih](){
                             g_state.encode_ok   = g_segmenter.encodeImage(px,iw,ih);
                             g_state.encode_done = true;
                         });
+#endif
                         g_state.status_msg="Encoding image..."; g_state.status_timer=60.f;
                     }
 

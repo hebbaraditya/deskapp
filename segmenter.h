@@ -13,6 +13,17 @@
 // it, same as Platform::OpenImageFile/SaveFile — main.cpp using Segmenter
 // never needs to know or care which backend is compiled in.
 
+// ── Model I/O shape constants ─────────────────────────────────────────────────
+// Shared by segmenter_math.cpp (preprocess/upscaleMask — pure math, no ORT
+// dependency, compiled into both native and web builds) and each platform's
+// Impl. `static` gives each translation unit its own internal-linkage copy,
+// same pattern as kFontManifest in canvas_objects.h — no ODR issue, just
+// keeps these single-source-of-truth instead of redefined per file.
+static constexpr int kSAMSize = 1024; // MobileSAM's fixed square input size
+static constexpr int kEmbedC  = 256;
+static constexpr int kEmbedH  = 64;
+static constexpr int kEmbedW  = 64;
+
 // ── Point prompt ─────────────────────────────────────────────────────────────
 struct PromptPoint {
     float x, y;      // pixel coords in the original image
