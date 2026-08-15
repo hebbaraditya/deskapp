@@ -363,15 +363,31 @@ void RenderTopBar(ImVec2 win_size)
         const char* fp = tinyfd_openFileDialog("Select Image","",4,filters,"Image Files",0);
         if (fp) {
             CanvasImage img;
-            img.transform.scale = 1.f;
             img.selected        = false;
             img.filename        = fp;
             int w, h;
             img.texture_id = LoadTextureFromFile(fp, &w, &h, img.pixels);
             if (img.texture_id) {
                 img.size = {(float)w, (float)h};
-                img.transform.position = {-(float)w * 0.5f, -(float)h * 0.5f};
+
+                // Fit-to-canvas: shrink to fit inside the visible viewport,
+                // never enlarge a small image past its native size.
+                const float pad       = 40.f;
+                ImVec2      avail     = {win_size.x - 60.f, win_size.y - 56.f};
+                float       fit_scale = std::min(
+                    (avail.x - pad) / (float)w,
+                    (avail.y - pad) / (float)h);
+                img.transform.scale = std::min(1.f, fit_scale);
+
+                img.transform.position = {
+                    -(float)w * img.transform.scale * 0.5f,
+                    -(float)h * img.transform.scale * 0.5f
+                };
                 g_state.images.push_back(img);
+
+                // Reset the view so the newly loaded image is fully visible.
+                g_state.canvas_pan  = {0.f, 0.f};
+                g_state.canvas_zoom = 1.f;
             }
         }
     }

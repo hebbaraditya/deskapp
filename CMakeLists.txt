@@ -11,7 +11,7 @@ find_package(OpenGL REQUIRED)
 find_package(glfw3 REQUIRED)
 
 # ONNX Runtime
-set(ONNXRUNTIME_ROOT "/opt/homebrew/Cellar/onnxruntime/1.24.2")
+set(ONNXRUNTIME_ROOT "/opt/homebrew/Cellar/onnxruntime/1.29.0")
 include_directories(${ONNXRUNTIME_ROOT}/include/onnxruntime)
 include_directories(${ONNXRUNTIME_ROOT}/include)
 link_directories(${ONNXRUNTIME_ROOT}/lib)
