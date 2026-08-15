@@ -4,6 +4,7 @@
 #include "canvas_objects.h"
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TextTool
@@ -36,6 +37,7 @@ struct State {
     ImVec2 place_pos      = {0.f, 0.f}; // world-space position of new text
     TextStyle pending_style;           // style persists between placements
     bool   panel_open     = false;
+    bool   panel_hovered  = false;    // mouse is over the floating style panel
     int    frames_in_mode = 0;         // frames spent in current mode
     double mode_enter_time = 0.0;      // ImGui::GetTime() when mode last changed
 };
@@ -66,6 +68,26 @@ void drawAllText(const std::vector<TextObject>& texts,
 
 // Floating style panel (font, size, colors, stroke).
 bool drawStylePanel(State& state, std::vector<TextObject>& texts);
+
+// Draw + interact with transform handles (resize/rotate/mirror) for whichever
+// text is selected. Call every frame regardless of active tool — mirrors how
+// CanvasImage handles are always live, so a selected text can be dragged from
+// the Select tool the same way a selected image can.
+// `drags` is a persistent per-index drag-state map owned by the caller (like
+// AppState::image_drags) — keyed by index rather than pointer so it survives
+// `texts` reallocating.
+// Returns true if a handle consumed the mouse click this frame.
+bool updateSelectionHandles(std::vector<TextObject>& texts,
+                            std::unordered_map<int, DragState>& drags,
+                            ImDrawList* draw_list,
+                            ImVec2 canvas_min, ImVec2 canvas_size,
+                            ImVec2 pan, float zoom);
+
+// Force-finish any in-progress placement/edit — call when switching tools
+// away from Text mid-entry so work isn't silently discarded.
+// confirm=true commits the buffer if non-empty (same as Enter);
+// confirm=false discards it (same as Escape).
+void finish(std::vector<TextObject>& texts, State& state, bool confirm);
 
 // Helpers
 ImVec2 measureText(const TextObject& obj);

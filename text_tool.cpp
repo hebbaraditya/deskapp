@@ -56,6 +56,60 @@ static void drawTextWithStroke(ImDrawList* dl,
     dl->AddText(font, font_size, screen_pos, fill_col, text);
 }
 
+// Draw text as a true horizontal mirror image — each glyph's own shape is
+// flipped (via swapped U texture coordinates) AND its position is reflected
+// around the block's centre, the same result you'd get flipping a rendered
+// image of the text. Done directly with the font atlas already bound (same
+// convention ImFont::RenderChar relies on), glyph-by-glyph, so text stays
+// live-editable instead of needing to bake to a texture like CanvasImage
+// mirroring does.
+static void drawTextMirroredWithStroke(ImDrawList* dl,
+                                        ImFont* font, float font_size,
+                                        ImVec2 screen_pos,
+                                        const char* text,
+                                        ImVec4 fill, ImVec4 stroke,
+                                        float stroke_w)
+{
+    ImFontBaked* baked = font->GetFontBaked(font_size);
+    float  scale     = font_size / baked->Size;
+    ImVec2 text_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, text);
+
+    auto emitGlyphs = [&](ImVec2 origin, ImU32 col) {
+        float pen_x = 0.f;
+        for (const unsigned char* p = (const unsigned char*)text; *p; ++p) {
+            const ImFontGlyph* glyph = baked->FindGlyph((ImWchar)*p);
+            if (glyph && glyph->Visible) {
+                float x0 = pen_x + glyph->X0 * scale;
+                float x1 = pen_x + glyph->X1 * scale;
+                // Reflect this glyph's span around the block's centre line
+                float mx0 = text_size.x - x1;
+                float mx1 = text_size.x - x0;
+                ImVec2 a = { origin.x + mx0, origin.y + glyph->Y0 * scale };
+                ImVec2 b = { origin.x + mx1, origin.y + glyph->Y1 * scale };
+                // Swapped U flips the glyph's own pixels, not just its position
+                dl->PrimReserve(6, 4);
+                dl->PrimRectUV(a, b,
+                               { glyph->U1, glyph->V0 },
+                               { glyph->U0, glyph->V1 }, col);
+            }
+            pen_x += glyph ? glyph->AdvanceX * scale : 0.f;
+        }
+    };
+
+    if (stroke_w > 0.f) {
+        ImU32 stroke_col = ImGui::ColorConvertFloat4ToU32(stroke);
+        static const float dirs[8][2] = {
+            {-1,-1},{0,-1},{1,-1},
+            {-1, 0},       {1, 0},
+            {-1, 1},{0, 1},{1, 1}
+        };
+        for (auto& d : dirs)
+            emitGlyphs({ screen_pos.x + d[0]*stroke_w, screen_pos.y + d[1]*stroke_w },
+                       stroke_col);
+    }
+    emitGlyphs(screen_pos, ImGui::ColorConvertFloat4ToU32(fill));
+}
+
 // Draw a blinking cursor at the end of text
 static void drawCursor(ImDrawList* dl, ImFont* font, float font_size,
                         ImVec2 screen_pos, const char* text, float zoom)
@@ -193,23 +247,23 @@ void drawAllText(const std::vector<TextObject>& texts,
 
         ImVec2 sp = w2s(obj.transform.position, canvas_min, canvas_size, pan, zoom);
 
-        // Mirror: flip draw position
+        // Mirrored text is reflected in place, glyph-by-glyph (see
+        // drawTextMirroredWithStroke) — it occupies the exact same bounding
+        // box as unmirrored text, so hitTest()/transform handles stay
+        // correct without needing to know about the flip at all.
         if (obj.transform.mirrored) {
-            ImVec2 sz = font->CalcTextSizeA(display_size, FLT_MAX, 0.f,
-                                             obj.content.c_str());
-            sp.x += sz.x;
-            draw_list->PushClipRectFullScreen();
-            // Flip via negative scale trick using a push/pop of draw list scale
-            // Simple approach: just offset — true mirror needs transform matrix
-            // For now draw normally; full mirror in phase 2 with AddImageQuad approach
-            draw_list->PopClipRect();
+            drawTextMirroredWithStroke(draw_list, font, display_size, sp,
+                               obj.content.c_str(),
+                               obj.style.fill_color,
+                               obj.style.stroke_color,
+                               obj.style.stroke_width);
+        } else {
+            drawTextWithStroke(draw_list, font, display_size, sp,
+                               obj.content.c_str(),
+                               obj.style.fill_color,
+                               obj.style.stroke_color,
+                               obj.style.stroke_width);
         }
-
-        drawTextWithStroke(draw_list, font, display_size, sp,
-                           obj.content.c_str(),
-                           obj.style.fill_color,
-                           obj.style.stroke_color,
-                           obj.style.stroke_width);
     }
 }
 
@@ -218,7 +272,7 @@ void drawAllText(const std::vector<TextObject>& texts,
 // ─────────────────────────────────────────────────────────────────────────────
 bool drawStylePanel(State& state, std::vector<TextObject>& texts)
 {
-    if (!state.panel_open) return false;
+    if (!state.panel_open) { state.panel_hovered = false; return false; }
 
     bool changed = false;
     TextStyle& s = state.pending_style;
@@ -288,6 +342,26 @@ bool drawStylePanel(State& state, std::vector<TextObject>& texts)
     ImGui::TextDisabled("Double-click text to edit");
     ImGui::TextDisabled("Enter / Esc to confirm");
     ImGui::TextDisabled("Delete to remove selected");
+
+    // The canvas underneath does its own raw hit-testing (IsMouseHoveringRect
+    // against screen coords) with no idea this panel floats on top of it, so
+    // scrolling/clicking here was also reaching the canvas below — e.g. mouse
+    // wheel over the panel (or its open font dropdown/color picker popups,
+    // which render as separate child windows) zoomed the whole grid instead
+    // of just scrolling there. Checked here, after all widgets, with
+    // ChildWindows so an open popup still counts as "on the panel".
+    //
+    // IsWindowHovered() defaults to returning false in a bunch of cases we
+    // don't want here — most importantly, whenever ANY widget anywhere is
+    // "active" (e.g. mid-drag on the Size slider). Without the Allow* flags
+    // below, that gap let a click through to the canvas *while interacting
+    // with the panel*, which is exactly how a new text box could end up
+    // spawning on top of the dialog. We want a plain "is the mouse
+    // physically over this window" answer, so allow through all of it.
+    state.panel_hovered = ImGui::IsWindowHovered(
+        ImGuiHoveredFlags_ChildWindows |
+        ImGuiHoveredFlags_AllowWhenBlockedByPopup |
+        ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 
     ImGui::End();
 
@@ -374,51 +448,10 @@ void update(std::vector<TextObject>& texts,
             }
         }
 
-        // Draw selection handles for selected text
-        for (auto& obj : texts) {
-            if (!obj.selected) continue;
-
-            // Update cached size
-            obj.cached_size = measureText(obj);
-
-            // DragState lives on the object — we need one per TextObject.
-            // For simplicity we use a static map keyed by pointer.
-            // (In a real engine you'd store it in TextObject directly.)
-            static std::unordered_map<TextObject*, DragState> s_drags;
-            DragState& drag = s_drags[&obj];
-
-            bool consumed = TransformHandles::update(
-                draw_list, obj.transform, obj.cached_size,
-                drag, zoom, pan, canvas_min, canvas_size);
-
-            // Mirror button
-            if (TransformHandles::mirrorButton(
-                    draw_list, obj.transform, obj.cached_size,
-                    zoom, pan, canvas_min, canvas_size)) {
-                obj.transform.mirrored = !obj.transform.mirrored;
-            }
-
-            // Drag move (only if not on a handle)
-            if (!consumed) {
-                static bool s_moving = false;
-                static ImVec2 s_move_start_mouse;
-                static ImVec2 s_move_start_pos;
-
-                if (ImGui::IsMouseClicked(0) && hitTest(obj, mouse_world)) {
-                    s_moving = true;
-                    s_move_start_mouse = mouse_world;
-                    s_move_start_pos   = obj.transform.position;
-                }
-                if (s_moving && ImGui::IsMouseDown(0)) {
-                    obj.transform.position.x = s_move_start_pos.x +
-                        (mouse_world.x - s_move_start_mouse.x);
-                    obj.transform.position.y = s_move_start_pos.y +
-                        (mouse_world.y - s_move_start_mouse.y);
-                }
-                if (ImGui::IsMouseReleased(0)) s_moving = false;
-            }
-        }
-
+        // Selection handles + dragging are handled centrally by
+        // updateSelectionHandles(), called every frame regardless of tool
+        // (see main.cpp) — same as how CanvasImage handles work. That's what
+        // lets a selected text be dragged from the Select tool too.
         return;
     }
 
@@ -441,30 +474,38 @@ void update(std::vector<TextObject>& texts,
 
     ImVec2 screen_pos = w2s(text_world_pos, canvas_min, canvas_size, pan, zoom);
 
+    // Draw the live typing preview on the foreground draw list, not the
+    // canvas's own — the Text Style panel floats on top of the canvas, so if
+    // your first click (or any click) happens to land underneath where the
+    // panel sits, the canvas draw list would render the in-progress text
+    // *behind* the panel, hiding exactly what you're typing. Foreground
+    // draws after every window, so it's always visible while composing.
+    ImDrawList* preview_dl = ImGui::GetForegroundDrawList();
+
     // Draw live preview of what's being typed
     if (state.edit_buf[0] != '\0') {
-        drawTextWithStroke(draw_list, font, display_size, screen_pos,
+        drawTextWithStroke(preview_dl, font, display_size, screen_pos,
                            state.edit_buf,
                            style.fill_color, style.stroke_color,
                            style.stroke_width);
     }
 
     // Draw cursor
-    drawCursor(draw_list, font, display_size, screen_pos, state.edit_buf, zoom);
+    drawCursor(preview_dl, font, display_size, screen_pos, state.edit_buf, zoom);
 
     // Draw a subtle placement indicator box
     {
         ImVec2 hint_sz = font->CalcTextSizeA(display_size, FLT_MAX, 0.f,
             state.edit_buf[0] ? state.edit_buf : "Type here...");
         hint_sz.x = std::max(hint_sz.x, 120.f * zoom);
-        draw_list->AddRect(
+        preview_dl->AddRect(
             { screen_pos.x - 2.f, screen_pos.y - 2.f },
             { screen_pos.x + hint_sz.x + 8.f, screen_pos.y + display_size + 4.f },
             IM_COL32(100, 150, 255, 80), 3.f, 0, 1.f);
 
         // Placeholder text
         if (state.edit_buf[0] == '\0') {
-            draw_list->AddText(font, display_size, screen_pos,
+            preview_dl->AddText(font, display_size, screen_pos,
                                IM_COL32(180, 180, 180, 100), "Type here...");
         }
     }
@@ -512,36 +553,80 @@ void update(std::vector<TextObject>& texts,
     bool cancel = ImGui::IsKeyPressed(ImGuiKey_Escape);
 
     if (confirm || cancel) {
-        bool has_content = state.edit_buf[0] != '\0';
+        finish(texts, state, confirm);
+    }
+}
 
-        if (confirm && has_content) {
-            if (is_placing) {
-                // Create new TextObject
-                TextObject obj;
-                obj.content          = state.edit_buf;
-                obj.transform.position = state.place_pos;
-                obj.transform.scale    = 1.f;
-                obj.style              = style;
-                obj.selected           = false;
-                obj.cached_size        = measureText(obj);
-                texts.push_back(obj);
-            } else if (is_editing && state.editing_index >= 0) {
-                // Update existing
-                texts[state.editing_index].content = state.edit_buf;
-                texts[state.editing_index].style   = style;
-            }
-        } else if (cancel && is_editing && state.editing_index >= 0) {
-            // On cancel while editing, restore original (content unchanged)
-            // Style was already live-updated, restore from backup if needed
-            // (keeping it simple: cancel just exits without saving style changes)
+// ─────────────────────────────────────────────────────────────────────────────
+// finish — commit or discard whatever's in progress (PLACING/EDITING).
+// Shared by the Enter/Escape path above and by main.cpp when the user
+// switches tools mid-entry, so work is never silently dropped.
+// ─────────────────────────────────────────────────────────────────────────────
+void finish(std::vector<TextObject>& texts, State& state, bool confirm)
+{
+    if (state.mode == Mode::IDLE) return;
+
+    bool is_placing  = (state.mode == Mode::PLACING);
+    bool is_editing  = (state.mode == Mode::EDITING);
+    bool has_content = state.edit_buf[0] != '\0';
+
+    if (confirm && has_content) {
+        if (is_placing) {
+            TextObject obj;
+            obj.content             = state.edit_buf;
+            obj.transform.position  = state.place_pos;
+            obj.transform.scale     = 1.f;
+            obj.style                = state.pending_style;
+            obj.selected              = false;
+            obj.cached_size            = measureText(obj);
+            texts.push_back(obj);
+        } else if (is_editing && state.editing_index >= 0 &&
+                   state.editing_index < (int)texts.size()) {
+            texts[state.editing_index].content = state.edit_buf;
+            texts[state.editing_index].style   = state.pending_style;
+        }
+    }
+    // On cancel (or confirm with empty buffer), just drop out of the mode —
+    // nothing to save.
+
+    state.mode           = Mode::IDLE;
+    state.editing_index  = -1;
+    state.edit_buf[0]    = '\0';
+    state.frames_in_mode = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// updateSelectionHandles — resize/rotate/mirror handles + hookup for whichever
+// text is selected. Called every frame regardless of active tool (main.cpp),
+// so a selected text behaves exactly like a selected image.
+// ─────────────────────────────────────────────────────────────────────────────
+bool updateSelectionHandles(std::vector<TextObject>& texts,
+                            std::unordered_map<int, DragState>& drags,
+                            ImDrawList* draw_list,
+                            ImVec2 canvas_min, ImVec2 canvas_size,
+                            ImVec2 pan, float zoom)
+{
+    bool consumed_any = false;
+    for (int i = 0; i < (int)texts.size(); ++i) {
+        TextObject& obj = texts[i];
+        if (!obj.selected) continue;
+
+        obj.cached_size = measureText(obj);
+        DragState& drag = drags[i];
+
+        bool consumed = TransformHandles::update(
+            draw_list, obj.transform, obj.cached_size,
+            drag, zoom, pan, canvas_min, canvas_size);
+
+        if (TransformHandles::mirrorButton(
+                draw_list, obj.transform, obj.cached_size,
+                zoom, pan, canvas_min, canvas_size)) {
+            obj.transform.mirrored = !obj.transform.mirrored;
         }
 
-        // If confirmed and not cancelled, stay in IDLE but open panel for next
-        state.mode           = Mode::IDLE;
-        state.editing_index  = -1;
-        state.edit_buf[0]    = '\0';
-        state.frames_in_mode = 0;
+        consumed_any = consumed_any || consumed;
     }
+    return consumed_any;
 }
 
 } // namespace TextTool

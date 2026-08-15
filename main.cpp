@@ -54,6 +54,9 @@ struct AppState {
     // Text
     std::vector<TextObject> texts;
     TextTool::State         text_state;
+    bool   is_dragging_text = false;
+    // Per-text drag states for transform handles (keyed by index, like image_drags)
+    std::unordered_map<int, DragState> text_drags;
 
     // Segment
     int  seg_image_index = -1;
@@ -417,11 +420,23 @@ void RenderToolbar(ImVec2 win_size)
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {8, 8});
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  {0, 4});
 
+    // Switching tools away from Text mid-entry used to just silently drop
+    // whatever was being typed (internal mode stayed PLACING/EDITING even
+    // though current_tool moved on, so re-entering Text felt like it "went
+    // back" to a stuck state). Auto-commit instead, same as pressing Enter.
+    auto switchTool = [&](AppState::Tool tool) {
+        if (g_state.current_tool == AppState::TOOL_TEXT &&
+            g_state.text_state.mode != TextTool::Mode::IDLE) {
+            TextTool::finish(g_state.texts, g_state.text_state, /*confirm=*/true);
+        }
+        g_state.current_tool = tool;
+    };
+
     auto toolBtn = [&](const char* label, AppState::Tool tool,
                         ImVec4 active_col, const char* tooltip) {
         bool active = (g_state.current_tool == tool);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, active_col);
-        if (ImGui::Button(label, {40,40})) g_state.current_tool = tool;
+        if (ImGui::Button(label, {40,40})) switchTool(tool);
         if (active) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
     };
@@ -446,14 +461,20 @@ void RenderToolbar(ImVec2 win_size)
                            (int)g_state.prompt_points.size());
     }
 
-    // Keyboard shortcuts (only when not typing text)
+    // Keyboard shortcuts (only when not typing text). Text entry here is a
+    // hand-rolled canvas overlay, not a real ImGui InputText widget, so
+    // io.WantTextInput alone doesn't cover it — without the extra mode check
+    // below, typing a letter like "v" or "t" into a text box would double as
+    // a tool-switch shortcut and silently boot you out of the text tool.
     ImGuiIO& io = ImGui::GetIO();
-    if (!io.WantTextInput) {
-        if (ImGui::IsKeyPressed(ImGuiKey_V)) g_state.current_tool = AppState::TOOL_SELECT;
-        if (ImGui::IsKeyPressed(ImGuiKey_H)) g_state.current_tool = AppState::TOOL_HAND;
-        if (ImGui::IsKeyPressed(ImGuiKey_S)) g_state.current_tool = AppState::TOOL_SEGMENT;
+    bool typing_text = (g_state.current_tool == AppState::TOOL_TEXT &&
+                        g_state.text_state.mode != TextTool::Mode::IDLE);
+    if (!io.WantTextInput && !typing_text) {
+        if (ImGui::IsKeyPressed(ImGuiKey_V)) switchTool(AppState::TOOL_SELECT);
+        if (ImGui::IsKeyPressed(ImGuiKey_H)) switchTool(AppState::TOOL_HAND);
+        if (ImGui::IsKeyPressed(ImGuiKey_S)) switchTool(AppState::TOOL_SEGMENT);
         if (ImGui::IsKeyPressed(ImGuiKey_T)) {
-            g_state.current_tool = AppState::TOOL_TEXT;
+            switchTool(AppState::TOOL_TEXT);
             g_state.text_state.panel_open = true;
         }
     }
@@ -544,6 +565,11 @@ void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
     // Always draw all text (visible in every tool mode)
     TextTool::drawAllText(g_state.texts, dl, cmin, canvas_size, pan, zoom);
 
+    // Selected text's resize/rotate/mirror handles — always live, same as
+    // selected image handles above, regardless of which tool is active.
+    bool text_handle_consumed = TextTool::updateSelectionHandles(
+        g_state.texts, g_state.text_drags, dl, cmin, canvas_size, pan, zoom);
+
     // Crosshair at world origin
     ImVec2 orig = w2s({0,0});
     dl->AddLine({orig.x-10,orig.y},{orig.x+10,orig.y}, IM_COL32(100,150,255,255), 2.f);
@@ -551,7 +577,13 @@ void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
 
     // ── Input ─────────────────────────────────────────────────────────────────
     ImGuiIO& io = ImGui::GetIO();
-    bool in_canvas = ImGui::IsMouseHoveringRect(cmin, cmax);
+    // Exclude the floating Text Style panel — it visually sits on top of the
+    // canvas, but our hit-testing here is raw screen-rect math with no idea
+    // any other window exists, so scrolling/clicking on the panel was also
+    // reaching the canvas underneath (e.g. mouse wheel there zoomed the grid
+    // instead of just scrolling the panel).
+    bool in_canvas = ImGui::IsMouseHoveringRect(cmin, cmax) &&
+                     !g_state.text_state.panel_hovered;
 
     if (in_canvas) {
         // Zoom toward cursor
@@ -576,51 +608,106 @@ void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
                              dl, cmin, canvas_size, pan, zoom, mw, in_canvas);
 
         // ── Select tool ───────────────────────────────────────────────────────
+        // Handles both images AND text (text takes priority when they overlap,
+        // since text is drawn on top). Selecting one type deselects the other.
         } else if (g_state.current_tool == AppState::TOOL_SELECT) {
 
+            // Find whichever text is currently selected (at most one, by
+            // convention) — computed on demand instead of cached, since a
+            // text can also be selected from the Text tool's own click
+            // handling, and this stays correct either way.
+            auto findSelectedText = [&]() -> int {
+                for (int i = 0; i < (int)g_state.texts.size(); i++)
+                    if (g_state.texts[i].selected) return i;
+                return -1;
+            };
+
             if (ImGui::IsMouseClicked(0)) {
-                // Check if a corner handle was just activated this click
+                // Was a handle (image or text) just grabbed this click?
                 // (TransformHandles::update sets drag.active inside the draw loop above)
-                bool handle_just_activated = false;
-                if (g_state.selected_image_index >= 0) {
+                bool handle_just_activated = text_handle_consumed;
+                if (!handle_just_activated && g_state.selected_image_index >= 0) {
                     auto it = g_state.image_drags.find(g_state.selected_image_index);
                     if (it != g_state.image_drags.end())
                         handle_just_activated = (it->second.active != HandleId::None);
                 }
 
                 if (!handle_just_activated) {
-                    // Find which image was clicked
-                    int new_sel = -1;
-                    for (int i = (int)g_state.images.size()-1; i >= 0; i--) {
-                        CanvasImage& img = g_state.images[i];
-                        float x0 = img.transform.position.x;
-                        float y0 = img.transform.position.y;
-                        float x1 = x0 + img.size.x * img.transform.scale;
-                        float y1 = y0 + img.size.y * img.transform.scale;
-                        if (mw.x>=x0 && mw.x<=x1 && mw.y>=y0 && mw.y<=y1) {
-                            new_sel = i; break;
-                        }
+                    // Text hit-test first — text is drawn on top of images
+                    int text_hit = -1;
+                    for (int i = (int)g_state.texts.size()-1; i >= 0; i--) {
+                        if (TextTool::hitTest(g_state.texts[i], mw)) { text_hit = i; break; }
                     }
 
-                    // Deselect all
-                    for (auto& img : g_state.images) img.selected = false;
-                    g_state.selected_image_index = new_sel;
+                    if (text_hit >= 0) {
+                        for (auto& img : g_state.images) img.selected = false;
+                        g_state.selected_image_index = -1;
+                        g_state.is_dragging_image    = false;
 
-                    if (new_sel >= 0) {
-                        g_state.images[new_sel].selected = true;
-                        // Only start image drag if NOT clicking a handle area
-                        // (handle areas are ~10px from corners in screen space,
-                        //  but we can't easily check that here — so we defer:
-                        //  drag starts next frame if drag.active is still None)
-                        g_state.is_dragging_image = true;
-                        g_state.drag_start_pos    = mw;
+                        for (auto& t : g_state.texts) t.selected = false;
+                        g_state.texts[text_hit].selected = true;
+                        g_state.is_dragging_text = true;
+                        g_state.drag_start_pos   = mw;
                     } else {
-                        g_state.is_dragging_image = false;
+                        // Find which image was clicked
+                        int new_sel = -1;
+                        for (int i = (int)g_state.images.size()-1; i >= 0; i--) {
+                            CanvasImage& img = g_state.images[i];
+                            float x0 = img.transform.position.x;
+                            float y0 = img.transform.position.y;
+                            float x1 = x0 + img.size.x * img.transform.scale;
+                            float y1 = y0 + img.size.y * img.transform.scale;
+                            if (mw.x>=x0 && mw.x<=x1 && mw.y>=y0 && mw.y<=y1) {
+                                new_sel = i; break;
+                            }
+                        }
+
+                        // Deselect all
+                        for (auto& t : g_state.texts) t.selected = false;
+                        g_state.is_dragging_text = false;
+                        for (auto& img : g_state.images) img.selected = false;
+                        g_state.selected_image_index = new_sel;
+
+                        if (new_sel >= 0) {
+                            g_state.images[new_sel].selected = true;
+                            // Only start image drag if NOT clicking a handle area
+                            // (handle areas are ~10px from corners in screen space,
+                            //  but we can't easily check that here — so we defer:
+                            //  drag starts next frame if drag.active is still None)
+                            g_state.is_dragging_image = true;
+                            g_state.drag_start_pos    = mw;
+                        } else {
+                            g_state.is_dragging_image = false;
+                        }
                     }
                 }
             }
 
-            // Drag move — only when no handle is active
+            // Drag move — text (only when no handle is active)
+            if (g_state.is_dragging_text) {
+                int sel = findSelectedText();
+                if (sel >= 0) {
+                    auto drag_it = g_state.text_drags.find(sel);
+                    bool handle_active = (drag_it != g_state.text_drags.end() &&
+                                          drag_it->second.active != HandleId::None);
+                    if (ImGui::IsMouseDown(0)) {
+                        if (!handle_active) {
+                            TextObject& t = g_state.texts[sel];
+                            t.transform.position.x += mw.x - g_state.drag_start_pos.x;
+                            t.transform.position.y += mw.y - g_state.drag_start_pos.y;
+                            g_state.drag_start_pos = mw;
+                        } else {
+                            g_state.drag_start_pos = mw;
+                        }
+                    } else {
+                        g_state.is_dragging_text = false;
+                    }
+                } else {
+                    g_state.is_dragging_text = false;
+                }
+            }
+
+            // Drag move — image (only when no handle is active)
             if (g_state.is_dragging_image && g_state.selected_image_index >= 0) {
                 // Use find() not operator[] — operator[] inserts a default DragState
                 // with active=None, making handle detection always fail
@@ -643,7 +730,19 @@ void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
                 }
             }
 
-            // Delete key
+            // Delete key — text
+            if (!io.WantTextInput &&
+                (ImGui::IsKeyPressed(ImGuiKey_Delete) ||
+                 ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+                int sel = findSelectedText();
+                if (sel >= 0) {
+                    g_state.texts.erase(g_state.texts.begin() + sel);
+                    g_state.text_drags.erase(sel);
+                    g_state.is_dragging_text = false;
+                }
+            }
+
+            // Delete key — image
             if (g_state.selected_image_index >= 0 && !io.WantTextInput &&
                 (ImGui::IsKeyPressed(ImGuiKey_Delete) ||
                  ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
