@@ -3,6 +3,15 @@
 #include "imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
 #include <stdio.h>
+// Turns `while (!glfwWindowShouldClose(window)) { ... }` into something
+// emscripten_set_main_loop() can drive on web, via EMSCRIPTEN_MAINLOOP_BEGIN/
+// END wrapping the exact same loop body — no-ops on native. Official Dear
+// ImGui technique (examples/libs/emscripten/emscripten_mainloop_stub.h),
+// copied here rather than reached into the external/imgui submodule so it
+// doesn't depend on that pin's examples/ directory sticking around.
+#ifdef __EMSCRIPTEN__
+#include "emscripten_mainloop_stub.h"
+#endif
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -205,12 +214,28 @@ int main(int argc, char** argv)
 {
     if (!glfwInit()) { fprintf(stderr, "Failed to init GLFW\n"); return -1; }
 
-    const char* glsl_version = "#version 330";
+    // GL context + matching GLSL version string for ImGui_ImplOpenGL3_Init()
+    // below — these have to agree with each other and with the platform.
+    // imgui_impl_opengl3.h auto-detects IMGUI_IMPL_OPENGL_ES2 under
+    // __EMSCRIPTEN__ (GLES2/WebGL1) internally, but that only changes how
+    // the *backend* renders — the glsl_version string we hand it here still
+    // has to match, or shader compilation fails outright (desktop "#version
+    // 330" uses in/out and other GLSL 3.30 syntax GLES2's "#version 100"
+    // doesn't support at all).
+    const char* glsl_version;
+#ifdef __EMSCRIPTEN__
+    glsl_version = "#version 100";
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+#else
+    glsl_version = "#version 330";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
 #endif
 
     GLFWwindow* window = glfwCreateWindow(1440, 900, "Yoinkboard", NULL, NULL);
@@ -250,6 +275,9 @@ int main(int argc, char** argv)
     c[ImGuiCol_SliderGrabActive] = {0.50f,0.70f,1.00f,1.f};
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+#ifdef __EMSCRIPTEN__
+    ImGui_ImplGlfw_InstallEmscriptenCallbacks(window, "#canvas");
+#endif
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     // Load fonts BEFORE first NewFrame so atlas includes them
@@ -260,7 +288,13 @@ int main(int argc, char** argv)
         fprintf(stderr, "Warning: MobileSAM models not found.\n");
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    while (!glfwWindowShouldClose(window)) {
+#ifdef __EMSCRIPTEN__
+    io.IniFilename = nullptr; // no persistent filesystem to fopen() an imgui.ini on
+    EMSCRIPTEN_MAINLOOP_BEGIN
+#else
+    while (!glfwWindowShouldClose(window))
+#endif
+    {
         glfwPollEvents();
 
         // Async encode completion
@@ -342,7 +376,16 @@ int main(int argc, char** argv)
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+#ifdef __EMSCRIPTEN__
+    EMSCRIPTEN_MAINLOOP_END;
+#endif
 
+    // On web, emscripten_set_main_loop() above never actually returns —
+    // it hands control back to the browser's event loop and keeps calling
+    // back into the loop body via requestAnimationFrame, so nothing below
+    // this point runs there in practice. Left in place (rather than #ifdef'd
+    // out) because it still needs to compile, and matches the official
+    // Dear ImGui Emscripten example's own structure.
     if (g_state.encode_thread.joinable()) g_state.encode_thread.join();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

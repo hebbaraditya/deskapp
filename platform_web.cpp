@@ -39,15 +39,15 @@ yoinkboard_web_image_loaded(unsigned char* data, int size)
 // what OpenImageFile's callback expects, just asynchronously.
 EM_JS(void, web_open_image_file, (), {
     if (!Module.__yoinkboardFileInput) {
-        var input = document.createElement('input');
-        input.type = 'file';
-        input.accept = 'image/png,image/jpeg,image/bmp';
-        input.style.display = 'none';
+        var input = document.createElement("input");
+        input.type = "file";
+        input.accept = "image/png,image/jpeg,image/bmp";
+        input.style.display = "none";
         document.body.appendChild(input);
         Module.__yoinkboardFileInput = input;
     }
     var input = Module.__yoinkboardFileInput;
-    input.value = ''; // so picking the same file twice still fires 'change'
+    input.value = ""; // so picking the same file twice still fires "change"
     input.onchange = function() {
         var file = input.files[0];
         if (!file) return;
@@ -76,9 +76,9 @@ void OpenImageFile(BytesLoadedFn on_loaded)
 EM_JS(void, web_save_file,
       (const char* name, const unsigned char* data, int size), {
     var bytes = HEAPU8.subarray(data, data + size);
-    var blob = new Blob([bytes], { type: 'image/png' });
+    var blob = new Blob([bytes], { type: "image/png" });
     var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
+    var a = document.createElement("a");
     a.href = url;
     a.download = UTF8ToString(name);
     document.body.appendChild(a);
