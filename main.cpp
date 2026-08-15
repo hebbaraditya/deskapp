@@ -14,7 +14,7 @@
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-#include "tinyfiledialogs.h"
+#include "platform.h"
 #include "segmenter.h"
 #include "canvas_objects.h"
 #include "transform_handles.h"
@@ -25,8 +25,13 @@ void RenderCanvas(ImDrawList* draw_list, ImVec2 canvas_pos, ImVec2 canvas_size,
                   ImVec2& pan_offset, float& zoom_level);
 void RenderToolbar(ImVec2 window_size);
 void RenderTopBar(ImVec2 window_size);
-GLuint LoadTextureFromFile(const char* filename, int* out_width, int* out_height,
-                           std::vector<unsigned char>& out_pixels);
+// Decodes an already-in-memory encoded image (PNG/JPEG/BMP) and uploads it
+// as a GL texture. Takes bytes rather than a path — Platform::OpenImageFile
+// hands back bytes on both native and web, since there's no meaningful
+// filesystem path for a file the user picked in a browser.
+GLuint LoadTextureFromMemory(const unsigned char* data, size_t size,
+                             int* out_width, int* out_height,
+                             std::vector<unsigned char>& out_pixels);
 GLuint CreateTextureFromPixels(const std::vector<unsigned char>& pixels, int w, int h);
 void   UpdateTextureFromPixels(GLuint tex_id, const std::vector<unsigned char>& pixels, int w, int h);
 void   ApplyMaskToPixels(std::vector<unsigned char>& pixels,
@@ -167,16 +172,29 @@ void ExportImageAsPNG(int idx)
     if (idx < 0 || idx >= (int)g_state.images.size()) return;
     CanvasImage& img = g_state.images[idx];
     if (img.pixels.empty()) return;
-    const char* filters[] = {"*.png"};
-    const char* path = tinyfd_saveFileDialog("Export PNG", "output.png", 1, filters, "PNG");
-    if (!path) return;
     int w=(int)img.size.x, h=(int)img.size.y;
-    if (stbi_write_png(path, w, h, 4, img.pixels.data(), w*4)) {
-        g_state.status_msg   = std::string("Exported: ") + path;
-        g_state.status_timer = 4.f;
-    } else {
+
+    // Encode to an in-memory buffer first (fully portable — stb_image_write
+    // doesn't care whether the bytes end up on disk or in a browser
+    // download), then hand off to the platform to actually deliver it.
+    std::vector<unsigned char> png_bytes;
+    auto write_cb = [](void* ctx, void* data, int size) {
+        auto* out   = static_cast<std::vector<unsigned char>*>(ctx);
+        auto* bytes = static_cast<unsigned char*>(data);
+        out->insert(out->end(), bytes, bytes + size);
+    };
+    if (!stbi_write_png_to_func(write_cb, &png_bytes, w, h, 4, img.pixels.data(), w*4)) {
         g_state.status_msg   = "Export failed!";
         g_state.status_timer = 3.f;
+        return;
+    }
+
+    if (Platform::SaveFile("output.png", png_bytes.data(), png_bytes.size())) {
+        g_state.status_msg   = "Exported!";
+        g_state.status_timer = 4.f;
+    } else {
+        g_state.status_msg   = "Export cancelled";
+        g_state.status_timer = 2.f;
     }
 }
 
@@ -355,14 +373,15 @@ void RenderTopBar(ImVec2 win_size)
 
     // Load image
     if (ImGui::Button("Image")) {
-        const char* filters[] = {"*.png","*.jpg","*.jpeg","*.bmp"};
-        const char* fp = tinyfd_openFileDialog("Select Image","",4,filters,"Image Files",0);
-        if (fp) {
+        // win_size is a stack local — captured by value, not reference,
+        // since on web this callback fires later (async file picker), well
+        // after RenderTopBar has returned and any reference would dangle.
+        Platform::OpenImageFile([win_size](const unsigned char* data, size_t size) {
             CanvasImage img;
-            img.selected        = false;
-            img.filename        = fp;
+            img.selected = false;
+            img.filename = "image"; // no real path on web; not used for I/O anywhere
             int w, h;
-            img.texture_id = LoadTextureFromFile(fp, &w, &h, img.pixels);
+            img.texture_id = LoadTextureFromMemory(data, size, &w, &h, img.pixels);
             if (img.texture_id) {
                 img.size = {(float)w, (float)h};
 
@@ -385,7 +404,7 @@ void RenderTopBar(ImVec2 win_size)
                 g_state.canvas_pan  = {0.f, 0.f};
                 g_state.canvas_zoom = 1.f;
             }
-        }
+        });
     }
     ImGui::SameLine();
 
@@ -851,20 +870,21 @@ void RenderCanvas(ImDrawList* dl, ImVec2 canvas_pos, ImVec2 canvas_size,
 // ─────────────────────────────────────────────────────────────────────────────
 // Texture helpers
 // ─────────────────────────────────────────────────────────────────────────────
-GLuint LoadTextureFromFile(const char* filename, int* out_w, int* out_h,
-                           std::vector<unsigned char>& out_pixels)
+GLuint LoadTextureFromMemory(const unsigned char* data, size_t size,
+                             int* out_w, int* out_h,
+                             std::vector<unsigned char>& out_pixels)
 {
     int w, h, ch;
-    unsigned char* data = stbi_load(filename, &w, &h, &ch, 4);
-    if (!data) { fprintf(stderr,"Failed to load: %s\n", filename); return 0; }
-    out_pixels.assign(data, data + w*h*4);
+    unsigned char* pixels = stbi_load_from_memory(data, (int)size, &w, &h, &ch, 4);
+    if (!pixels) { fprintf(stderr, "Failed to decode image: %s\n", stbi_failure_reason()); return 0; }
+    out_pixels.assign(pixels, pixels + w*h*4);
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    stbi_image_free(data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    stbi_image_free(pixels);
     *out_w = w; *out_h = h;
     return tex;
 }

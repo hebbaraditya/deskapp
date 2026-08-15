@@ -32,6 +32,7 @@ add_executable(yoinkboard
     main.cpp
     segmenter.cpp
     text_tool.cpp
+    platform_native.cpp
     tinyfiledialogs.c
     stb_image_impl.cpp
     ${IMGUI_SOURCES}
