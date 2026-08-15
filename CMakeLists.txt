@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(deskapp)
+project(yoinkboard)
 
 set(CMAKE_CXX_STANDARD 17)
 set(OpenGL_GL_PREFERENCE GLVND)
@@ -28,7 +28,7 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-add_executable(deskapp
+add_executable(yoinkboard
     main.cpp
     segmenter.cpp
     text_tool.cpp
@@ -37,13 +37,13 @@ add_executable(deskapp
     ${IMGUI_SOURCES}
 )
 
-target_include_directories(deskapp PRIVATE
+target_include_directories(yoinkboard PRIVATE
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(deskapp PRIVATE
+target_link_libraries(yoinkboard PRIVATE
     glfw
     OpenGL::GL
     ${CMAKE_DL_LIBS}

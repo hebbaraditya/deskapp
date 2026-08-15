@@ -195,7 +195,7 @@ int main(int argc, char** argv)
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    GLFWwindow* window = glfwCreateWindow(1440, 900, "Deskapp", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1440, 900, "Yoinkboard", NULL, NULL);
     if (!window) { fprintf(stderr, "Failed to create window\n"); glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -346,7 +346,7 @@ void RenderTopBar(ImVec2 win_size)
 
     ImGui::SetCursorPos({20, 16});
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1,1));
-    ImGui::Text("Deskapp");
+    ImGui::Text("Yoinkboard");
     ImGui::PopStyleColor();
 
     ImGui::SetCursorPos({120, 12});

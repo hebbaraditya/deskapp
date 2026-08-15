@@ -1,4 +1,4 @@
-# deskapp
+# Yoinkboard
 
 Tried to clone the dingboard. Got most of the way there, then started
 preparing for interviews. If anyone's interested, feel free to continue
@@ -54,7 +54,7 @@ things like the MobileSAM models using paths relative to the current
 working directory:
 
 ```bash
-./build/deskapp
+./build/yoinkboard
 ```
 
 Without the MobileSAM model files (see below), the app still runs fine;
@@ -93,6 +93,6 @@ curl -L -o models/mobile_sam.pt \
 python3 export_mobilesam.py
 ```
 
-Once those two files exist, relaunch `./build/deskapp` from the repo
+Once those two files exist, relaunch `./build/yoinkboard` from the repo
 root and the segment tool works: left-click adds foreground points,
 right-click background points, Enter extracts, Esc cancels.
