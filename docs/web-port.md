@@ -33,6 +33,57 @@ inference. See "Seams" below.
    file, plus self-hosting onnxruntime-web's dist files instead of the
    CDN this currently depends on.
 
+## Stage 5 log — deployment (in progress)
+
+**Model hosting size problem:** Cloudflare Pages caps individual files at
+25 MiB (Cloudflare's own documented limit, confirmed against the current
+docs, not assumed). The fp32 encoder doesn't fit either way it's counted —
+`mobile_sam_encoder.onnx` (~26.7MB) and its external-data sibling
+`mobile_sam_encoder.onnx.data` (~26.6MB) both individually exceed it. The
+decoder (~15.8MB) is fine as-is.
+
+**fp16 quantization attempt — abandoned, real bug, not an accuracy
+tradeoff.** Tried converting the encoder to fp16 (`quantize_fp16.py`,
+using `onnxconverter_common.float16.convert_float_to_float16`) to both
+halve the size and — since the result comfortably clears the threshold
+where ONNX embeds vs. externalizes weights — collapse it back into a
+single ~14.2MB file, avoiding the need for separate object storage
+entirely. The conversion completed without error and produced a
+plausible-looking file, but it doesn't load: ONNX Runtime Web fails
+session creation with
+
+```
+Can't create a session. ERROR_CODE: 1, ERROR_MESSAGE:
+.../onnxruntime/core/graph/graph_utils.cc:30 int
+onnxruntime::graph_utils::GetIndexFromName(...) itr != node_args.end()
+was false. Attempting to get index by a name which does not exist:
+InsertedPrecisionFreeCast_/encoder/neck/neck.3/Constant_output_0 for
+node: /encoder/layers.1/blocks.0/attn/norm/Mul/SimplifiedLayerNormFusion/
+```
+
+i.e. the conversion tool's cast-node cleanup pass corrupted the graph —
+it inserted a reference to a node it never actually wired up, specifically
+around a `SimplifiedLayerNormFusion` node (an ONNX-Runtime-specific fused
+op, from the TinyViT/MobileSAM encoder's LayerNorm pattern). Retried with
+`disable_shape_infer=True` (a documented workaround for similar
+`onnxconverter_common` graph-corruption issues) — identical error,
+reproducible, not a fluke. This is a real incompatibility between that
+library and this model's graph structure, not a quality/accuracy
+question — the model never gets far enough to load, let alone segment
+anything. Not worth more time chasing (e.g. trying ONNX Runtime's own
+`onnxruntime.transformers` float16 converter instead, which is aware of
+ORT-specific fused ops) given R2 is a known-good, already-planned
+alternative. `quantize_fp16.py` is left in the repo in case it's worth
+revisiting with a different toolchain later; `main.cpp` reverted to fp32
+on both platforms.
+
+**Current plan:** host the two large encoder files on Cloudflare R2
+(Cloudflare's own recommendation for exactly this case — "file too big
+for Pages" — and R2's zero-egress-fee pricing fits an asset-heavy WASM
+app well regardless). Decoder + everything else still ships from the
+single Pages deploy. `main.cpp`'s web encoder path will point at the R2
+URL instead of a relative path once that's live.
+
 ## Seams (native → web)
 
 | Seam | Native | Web |

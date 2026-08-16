@@ -283,7 +283,17 @@ int main(int argc, char** argv)
     // Load fonts BEFORE first NewFrame so atlas includes them
     TextTool::loadFonts();
 
-    if (!g_segmenter.loadModels("models/mobile_sam_encoder.onnx",
+    // fp16 quantization (quantize_fp16.py) was tried to dodge Cloudflare
+    // Pages' 25MB-per-file cap on the encoder without needing separate
+    // object storage, but onnxconverter_common corrupts this model's
+    // graph during conversion (a broken node reference around a
+    // SimplifiedLayerNormFusion node — reproducible, not a flaky issue,
+    // logged in docs/web-port.md). Reverted to fp32 on both platforms;
+    // the web encoder will instead be hosted on Cloudflare R2 once that's
+    // set up (URL TBD — currently a local path on both platforms, which
+    // only works for native/local testing).
+    const char* encoder_path = "models/mobile_sam_encoder.onnx";
+    if (!g_segmenter.loadModels(encoder_path,
                                 "models/mobile_sam_decoder.onnx"))
         fprintf(stderr, "Warning: MobileSAM models not found.\n");
 
