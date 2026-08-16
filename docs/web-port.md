@@ -77,12 +77,70 @@ alternative. `quantize_fp16.py` is left in the repo in case it's worth
 revisiting with a different toolchain later; `main.cpp` reverted to fp32
 on both platforms.
 
-**Current plan:** host the two large encoder files on Cloudflare R2
-(Cloudflare's own recommendation for exactly this case — "file too big
-for Pages" — and R2's zero-egress-fee pricing fits an asset-heavy WASM
-app well regardless). Decoder + everything else still ships from the
-single Pages deploy. `main.cpp`'s web encoder path will point at the R2
-URL instead of a relative path once that's live.
+**R2 setup — done, verified working.** Host the two large encoder files
+on Cloudflare R2 (Cloudflare's own recommendation for exactly this case —
+"file too big for Pages" — and R2's zero-egress-fee pricing fits an
+asset-heavy WASM app well regardless). Decoder + everything else still
+ships from the single Pages deploy.
+
+Steps (all via `wrangler`, installed with `npm install -g wrangler`):
+1. `wrangler login` — OAuth via browser. First attempt's auto-opened
+   browser tab didn't actually load the URL for some reason; opening the
+   printed URL directly with `open "<url>"` worked. The login process
+   also appears to time out/exit if left too long before the OAuth
+   callback completes — if `wrangler whoami` still says unauthenticated,
+   just re-run `wrangler login`.
+2. `wrangler r2 bucket create yoinkboard-models` — failed the first time
+   with `[code: 10042] Please enable R2 through the Cloudflare Dashboard`.
+   R2 needs a one-time account-level activation (accepting its terms) via
+   the dashboard — not something the CLI can do. Once enabled, the same
+   command succeeded.
+3. Uploaded both encoder files. **Gotcha:** `wrangler r2 object put`
+   defaults to a *local* simulated bucket in this wrangler version unless
+   you pass `--remote` — the first upload attempt silently succeeded
+   against local-only storage. Redid both with `--remote`:
+   ```bash
+   wrangler r2 object put yoinkboard-models/mobile_sam_encoder.onnx \
+     --file models/mobile_sam_encoder.onnx \
+     --content-type application/octet-stream --remote
+   wrangler r2 object put yoinkboard-models/mobile_sam_encoder.onnx.data \
+     --file models/mobile_sam_encoder.onnx.data \
+     --content-type application/octet-stream --remote
+   ```
+   Verified byte-for-byte via `wrangler r2 object get ... --remote --pipe
+   | wc -c` matching the original file sizes exactly (`bucket info`'s
+   aggregate stats lagged behind and briefly showed 0 objects — a stats
+   propagation delay, not a real problem; the direct GET is the real
+   check).
+4. `wrangler r2 bucket dev-url enable yoinkboard-models` — public
+   `r2.dev` URL, free, works entirely via CLI (no dashboard click needed
+   for this part, unlike enabling R2 itself). Got:
+   `https://pub-1412e4d9fcf2440abe938992a8d8dda4.r2.dev`
+5. **CORS.** Public objects are fetchable via `curl` by default, but
+   browsers separately enforce CORS on cross-origin `fetch()` — the
+   response had no `Access-Control-Allow-Origin` header until configured.
+   `wrangler r2 bucket cors set` needs a JSON file shaped like
+   Cloudflare's own R2 API (`{"rules": [{"allowed": {"methods": [...],
+   "origins": [...], "headers": [...]}, "maxAgeSeconds": ...}]}`), *not*
+   the plain S3-style `[{"AllowedOrigins": [...], ...}]` shape that seemed
+   like the obvious first guess — wrangler rejects that with "must contain
+   a 'rules' array". Set `origins: ["*"]`, `methods: ["GET", "HEAD"]`
+   (public model weights, no reason to restrict). Verified with
+   `curl -I -H "Origin: http://localhost:8000" <url>` showing
+   `Access-Control-Allow-Origin: *` in the response.
+6. `main.cpp`'s web encoder path now points at the R2 URL directly
+   (`#ifdef __EMSCRIPTEN__`), native unchanged (still a local relative
+   path). Rebuilt web, removed the local encoder files from the test
+   server's directory entirely (so there's no way to accidentally pass by
+   falling back to a local copy), and reconfirmed segmentation actually
+   works fetching the encoder cross-origin from `r2.dev` while the app
+   itself was served from `localhost:8000` — as close to the real
+   production topology (Pages domain + R2 domain, two different origins)
+   as local testing gets. Confirmed working, visually, by the user.
+
+**Next:** deploy the app itself (decoder + WASM/JS/fonts) to Cloudflare
+Pages, first via a one-off `wrangler pages deploy` to get a real URL live,
+then connect the GitHub repo in the dashboard for auto-deploy on push.
 
 ## Seams (native → web)
 

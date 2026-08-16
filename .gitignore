@@ -2,6 +2,9 @@
 build/
 build-web/
 
+# Wrangler local state/cache
+.wrangler/
+
 # Compiled object files
 *.o
 *.obj

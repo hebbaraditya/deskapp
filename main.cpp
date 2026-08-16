@@ -288,11 +288,21 @@ int main(int argc, char** argv)
     // object storage, but onnxconverter_common corrupts this model's
     // graph during conversion (a broken node reference around a
     // SimplifiedLayerNormFusion node — reproducible, not a flaky issue,
-    // logged in docs/web-port.md). Reverted to fp32 on both platforms;
-    // the web encoder will instead be hosted on Cloudflare R2 once that's
-    // set up (URL TBD — currently a local path on both platforms, which
-    // only works for native/local testing).
+    // logged in docs/web-port.md). Reverted to fp32 on both platforms.
+    //
+    // The fp32 encoder (~26.7MB + a ~26.6MB external-data sibling) still
+    // exceeds Cloudflare Pages' 25MB-per-file cap either way, so on web it's
+    // hosted on Cloudflare R2 instead (bucket: yoinkboard-models, public via
+    // its r2.dev URL, CORS opened to GET/HEAD from any origin) — ORT Web
+    // fetches the .onnx.data sibling automatically from the same path. The
+    // decoder (~15.8MB) fits under the cap fine, so it ships as part of the
+    // Pages deploy itself on both platforms, same relative path either way.
+#ifdef __EMSCRIPTEN__
+    const char* encoder_path =
+        "https://pub-1412e4d9fcf2440abe938992a8d8dda4.r2.dev/mobile_sam_encoder.onnx";
+#else
     const char* encoder_path = "models/mobile_sam_encoder.onnx";
+#endif
     if (!g_segmenter.loadModels(encoder_path,
                                 "models/mobile_sam_decoder.onnx"))
         fprintf(stderr, "Warning: MobileSAM models not found.\n");
