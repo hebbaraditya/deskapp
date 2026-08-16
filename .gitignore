@@ -1,5 +1,6 @@
-# Build directory
+# Build directories
 build/
+build-web/
 
 # Compiled object files
 *.o
