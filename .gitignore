@@ -1,6 +1,7 @@
 # Build directories
 build/
 build-web/
+dist-web/
 
 # Wrangler local state/cache
 .wrangler/

@@ -1,14 +1,18 @@
 # Yoinkboard
 
-Tried to clone the dingboard. Got most of the way there, then started
-preparing for interviews. If anyone's interested, feel free to continue
-the work.
+**Try it live: https://yoinkboard.pages.dev** — runs entirely in your
+browser via WebAssembly, no server, no account. MobileSAM segmentation
+runs client-side too (ONNX Runtime Web).
 
-AI-related tasks are pending — the goal is to integrate small models and
-run them locally (WASM eventually?) so we don't depend on a server the
-way dingboard does for half of its pipeline (the SAM model). MobileSAM
-segmentation is wired up in code and works locally now (see below);
-still on the wishlist: a proper background-removal model, maybe the one
+Tried to clone the dingboard. Got most of the way there, then started
+preparing for interviews. Picked it back up later — native macOS build
+(this README covers that below) plus a full web port (see
+[`docs/web-port.md`](docs/web-port.md) for how that was built, staged
+commit by commit).
+
+MobileSAM segmentation runs locally on both platforms — client-side in
+the browser via ONNX Runtime Web, no server involved, same as native.
+Still on the wishlist: a proper background-removal model, maybe the one
 ByteDance/TikTok put out, if I get the time and patience back (🤞).
 
 ## Requirements (macOS)
@@ -96,3 +100,41 @@ python3 export_mobilesam.py
 Once those two files exist, relaunch `./build/yoinkboard` from the repo
 root and the segment tool works: left-click adds foreground points,
 right-click background points, Enter extracts, Esc cancels.
+
+## Web build
+
+Live at **https://yoinkboard.pages.dev**, built from the `web-port`
+branch. Same source tree as native, no fork — see
+[`docs/web-port.md`](docs/web-port.md) for the full staged build-out
+(toolchain proof → platform abstraction → real app in-browser → MobileSAM
+via ONNX Runtime Web → Cloudflare deployment), including the real bugs
+hit and how they were fixed along the way.
+
+Building it yourself needs the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html):
+
+```bash
+git clone https://github.com/emscripten-core/emsdk.git
+cd emsdk && ./emsdk install latest && ./emsdk activate latest
+source ./emsdk_env.sh
+
+cd ../yoinkboard
+mkdir build-web && cd build-web
+emcmake cmake ..
+cmake --build . -j
+python3 -m http.server 8000   # then open http://localhost:8000/yoinkboard.html
+```
+
+The web build's MobileSAM encoder (too large for Cloudflare Pages' 25MB
+file cap) is fetched from Cloudflare R2 at build time rather than bundled
+— native's local `models/` files aren't needed to build for web, only to
+run the native binary.
+
+Redeploying (until GitHub auto-deploy is wired up — currently manual):
+
+```bash
+mkdir -p dist-web/models
+cp build-web/yoinkboard.{html,js,wasm,data} dist-web/
+cp dist-web/yoinkboard.html dist-web/index.html
+cp models/mobile_sam_decoder.onnx dist-web/models/
+wrangler pages deploy dist-web --project-name=yoinkboard
+```

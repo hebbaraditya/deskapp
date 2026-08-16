@@ -27,11 +27,14 @@ inference. See "Seams" below.
    this stage rather than done separately, since there was no way to
    meaningfully test one without the other anyway.
 4. **[DONE]** ONNX Runtime Web integration for MobileSAM segmentation.
-5. Cloudflare Pages deployment, including COOP/COEP headers (needed for
-   real `std::thread`/`SharedArrayBuffer` support down the line — not
-   required for what's working today, see stage 4 log) via a `_headers`
-   file, plus self-hosting onnxruntime-web's dist files instead of the
-   CDN this currently depends on.
+5. **[LIVE]** Cloudflare Pages deployment — **https://yoinkboard.pages.dev**
+   is up and confirmed working end-to-end in production (image load +
+   real segmentation, visually verified by the user). Remaining polish,
+   not blockers: connect GitHub for auto-deploy on push (currently manual
+   `wrangler pages deploy`), COOP/COEP headers (needed for real
+   `std::thread`/`SharedArrayBuffer` support down the line — not required
+   for what's working today), self-hosting onnxruntime-web's dist files
+   instead of the CDN this currently depends on.
 
 ## Stage 5 log — deployment (in progress)
 
@@ -138,9 +141,37 @@ Steps (all via `wrangler`, installed with `npm install -g wrangler`):
    production topology (Pages domain + R2 domain, two different origins)
    as local testing gets. Confirmed working, visually, by the user.
 
-**Next:** deploy the app itself (decoder + WASM/JS/fonts) to Cloudflare
-Pages, first via a one-off `wrangler pages deploy` to get a real URL live,
-then connect the GitHub repo in the dashboard for auto-deploy on push.
+**Pages deploy — done, live.** Deployed the app itself (decoder +
+WASM/JS/fonts) to Cloudflare Pages:
+
+1. `wrangler pages project create yoinkboard --production-branch=web-port`
+   — creates the project; picked `web-port` as the production branch
+   since that's what we're deploying from for now (see the earlier
+   decision to not merge to `main` yet).
+2. Staged a clean deploy directory (`dist-web/`, gitignored) containing
+   only the actual served assets — `yoinkboard.html`/`.js`/`.wasm`/`.data`
+   plus `models/mobile_sam_decoder.onnx` — deliberately excluding
+   CMake's own build files (`CMakeCache.txt`, `CMakeFiles/`, `Makefile`)
+   that live alongside them in `build-web/`. Also copied
+   `yoinkboard.html` → `index.html`, since Pages serves `index.html` by
+   default at the root and our emcc-generated shell isn't named that.
+3. `wrangler pages deploy dist-web --project-name=yoinkboard` — first
+   deploy. Warned about uncommitted changes in the working directory
+   (harmless here, was mid-commit-cycle; `--commit-dirty=true` silences
+   it if it comes up again).
+4. **Live at https://yoinkboard.pages.dev** — confirmed working in
+   production by the user: real image load, real MobileSAM segmentation,
+   Pages + R2 as two separate real domains (not simulated locally
+   anymore).
+
+**Remaining, not blockers:**
+- Connect GitHub repo in the Cloudflare dashboard for auto-deploy on
+  push — needs a manual OAuth-ish GitHub App install click in the
+  dashboard, not CLI-automatable. Redeploys are `wrangler pages deploy
+  dist-web --project-name=yoinkboard` (rebuild web, restage `dist-web/`,
+  redeploy) until that's set up.
+- COOP/COEP headers, self-hosting onnxruntime-web instead of CDN (see
+  the stage 5 plan bullet above).
 
 ## Seams (native → web)
 
